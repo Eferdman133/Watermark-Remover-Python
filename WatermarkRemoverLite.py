@@ -527,7 +527,7 @@ class ProcessorThread(threading.Thread):
 class App(Tk):
     def __init__(self):
         super().__init__()
-        self.title("PDF Watermark Remover (PyMuPDF-only)")
+        self.title("PDF Watermark Remover Lite by Emil Ferdman (With Help from ChatGPT")
         self.geometry("1100x720")
 
         # State
