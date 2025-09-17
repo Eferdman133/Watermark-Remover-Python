@@ -1,39 +1,31 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-PDF Watermark Remover - Tkinter GUI (PyMuPDF-only)
-- Non-destructive: edits watermark instructions / annots, preserves body text
-- Options: confidential phrases, generic repeating/diagonal text, vector/object overlays
-- Auto-preview (first page) for single file via temp processed copy
-- Multi-file batch processing with progress, cancel, and optional open-all
-"""
+# PDF Watermark Remover — Lite GUI (Tkinter + PyMuPDF only)
+# - Single dependency: PyMuPDF (fitz)
+# - Features: repeating text removal, vector/object watermarks (XObject hashing + q..Q),
+#             live preview (first page), progress bar, log, open outputs.
 
 import os
 import sys
-import re
 import math
-import queue
-import threading
-import tempfile
-import subprocess
+import re
 import platform
+import subprocess
+import tempfile
+import hashlib
+import threading
+import queue
+import base64
 from pathlib import Path
-from tkinter import (
-    Tk, Frame, Label, Button, Checkbutton, BooleanVar, Text, Scrollbar, StringVar,
-    filedialog, messagebox, BOTH, LEFT, RIGHT, X, Y, NSEW, W, E, N, S, TOP, BOTTOM
-)
-try:
-    # Tk 8.6 supports PNGs via PhotoImage(file=...), which we use for preview.
-    from tkinter import PhotoImage
-except Exception:
-    PhotoImage = None
 
 import fitz  # PyMuPDF
 
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-# ------------------------------
-# Cross-platform open helper
-# ------------------------------
+APP_TITLE = "PDF Watermark Remover (Lite)"
+PREVIEW_W, PREVIEW_H = 400, 500
+
+
 def open_file_cross_platform(path: str):
     try:
         if not path or not os.path.exists(path):
@@ -49,400 +41,392 @@ def open_file_cross_platform(path: str):
         pass
 
 
-# ------------------------------
-# Core removal engine (PyMuPDF-only)
-# ------------------------------
 class WatermarkRemover:
+    """Static watermark removal helpers."""
+
     @staticmethod
-    def remove_watermarks(input_path: str,
-                          output_path: str,
-                          remove_confidential: bool = True,
-                          remove_generic: bool = True,
-                          handle_vector: bool = True,
-                          status_cb=None) -> int:
-        """
-        Process one PDF and write a de-watermarked copy.
-        Returns: number of removed watermark elements (heuristic count).
-        """
+    def remove_watermarks(
+        input_path, output_path,
+        remove_generic=True,
+        handle_vector=True,
+        status_cb=None
+    ):
         doc = fitz.open(input_path)
         if doc.is_encrypted:
             doc.close()
             raise RuntimeError("PDF is password-protected")
 
-        removed = 0
+        total_removed = 0
 
-        # 0) Vector/object overlays (outlined shapes/logos)
         if handle_vector:
-            if status_cb: status_cb("Scanning vector/object overlays…")
-            removed += WatermarkRemover._remove_vector_object_watermarks(doc)
+            if status_cb: status_cb("Scanning for repeated vector/object watermarks…")
+            total_removed += WatermarkRemover._remove_vector_object_watermarks(doc)
 
-        # 1) Specific phrases + safe annotation delete
-        if remove_confidential:
-            if status_cb: status_cb("Removing phrase-based & watermark annotations…")
-            removed += WatermarkRemover._remove_confidential_watermarks(doc)
-
-        # 2) Repeating text + diagonal/large text
         if remove_generic:
-            if status_cb: status_cb("Detecting repeating/diagonal text watermarks…")
-            removed += WatermarkRemover._remove_generic_watermarks(doc)
+            if status_cb: status_cb("Detecting & removing generic repeating text watermarks…")
+            total_removed += WatermarkRemover._remove_generic_watermarks(doc)
 
-        # 3) Artifact-tagged watermark blocks
-        if status_cb: status_cb("Removing artifact-tagged watermark blocks…")
-        removed += WatermarkRemover._remove_artifact_watermarks(doc)
+        if status_cb: status_cb("Cleaning artifact-based watermark blocks…")
+        total_removed += WatermarkRemover._remove_artifact_watermarks(doc)
 
-        # Save
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
-        return removed
+        return total_removed
 
-    # ---------- VECTOR / OBJECT-BASED ----------
+    # ---------- VECTOR / OBJECT-BASED WATERMARK (XObject hashing + q..Q majority) ----------
     @staticmethod
-    def _remove_vector_object_watermarks(doc) -> int:
-        """
-        Heuristic: remove q..Q chunks that look like big path overlays:
-        - Many path ops (m l c re h S s f f* B B* b b*)
-        - Rotated transform (cm) ~20–70°
-        - Often near end of stream (overlay); and/or page drawings cover a big area.
-        Baked-in defaults (no knobs exposed).
-        """
-        stream_tail_fraction = 0.70
-        min_vector_ops = 0
-        min_vector_score = 0
-        angle_min, angle_max = 20, 80
-        area_frac_min = 0.0
+    def _remove_vector_object_watermarks(
+        doc,
+        sample_pages=5,
+        min_vector_ops_sample=5,
+        min_vector_ops_remove=5,
+        repeat_threshold=0.8,        # appear on ≥ 80% of sampled pages
+    ):
+        if len(doc) == 0:
+            return 0
 
-        removed = 0
+        qQ_split      = re.compile(r"(q.*?Q)", re.S)
+        text_ops_re   = re.compile(r"BT|Tj|TJ", re.I)
+        path_ops_re   = re.compile(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\*?|B\*?|b\*?|W\*?|W|n|cm)(?![A-Za-z])")
+        xobj_do_full  = re.compile(r"/([A-Za-z0-9_.#-]+)\s+Do")
+        opseq_re      = re.compile(r"(?<![A-Za-z])(?:q|Q|cm|m|l|c|re|h|S|s|f\*?|B\*?|b\*?|W\*?|W|n|Do|gs|sh|SCN?|scn?)(?![A-Za-z])")
+        num_re        = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-        # Precompute page drawings to estimate coverage
-        drawings_meta = []
-        for pno in range(len(doc)):
+        sample_n = min(sample_pages, len(doc))
+        hit_min  = max(1, int(round(sample_n * repeat_threshold)))
+
+        def _sig(chunk: str) -> str:
+            opseq = " ".join(opseq_re.findall(chunk))
+            norm  = num_re.sub("<n>", chunk)
+            norm  = re.sub(r"\s+", " ", norm)
+            return hashlib.sha1((opseq + "|" + norm).encode("utf-8", "ignore")).hexdigest()
+
+        # Stage A: repeated XObjects (by stream hash)
+        per_page_xobj_hashes = []
+
+        def _xobject_stream_hash(doc, xref):
             try:
-                page = doc.load_page(pno)
-                drs = page.get_drawings()
+                data = doc.xref_stream(xref) or b""
             except Exception:
-                drs = []
-            union = None
-            for d in drs:
-                r = d.get("rect")
-                if r:
-                    union = r if union is None else union | r
-            drawings_meta.append((drs, union))
+                data = b""
+            return hashlib.sha1(b"%d|" % len(data) + data[:4096] + b"|" + data[-4096:]).hexdigest()
 
-        qQ_split = re.compile(r"(q.*?Q)", re.S)
-        path_ops_re = re.compile(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\*?|B\*?|b\*?)(?![A-Za-z])")
-        text_ops_re = re.compile(r"BT|Tj|TJ")
-        xobj_do_re = re.compile(r"/[A-Za-z0-9_.#-]+\s+Do")
-        cm_re = re.compile(
-            r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+cm"
-        )
-
-        def has_diag_cm(chunk: str) -> bool:
-            for a, b, c, d, _, _ in cm_re.findall(chunk):
-                try:
-                    a, b = float(a), float(b)
-                    ang = abs(math.degrees(math.atan2(b, a)))
-                    if angle_min <= ang <= angle_max:
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        for pno in range(len(doc)):
+        for pno in range(sample_n):
             page = doc.load_page(pno)
-            xrefs = page.get_contents()
-            if not xrefs:
-                continue
-
+            page_hashes = set()
             try:
                 raw = page.read_contents().decode("latin-1", errors="ignore")
             except Exception:
-                continue
+                per_page_xobj_hashes.append(page_hashes); continue
 
-            parts = qQ_split.split(raw)
-            if len(parts) <= 1:
-                continue
-
-            page_area = max(1.0, page.rect.get_area())
-            drs, union_rect = drawings_meta[pno]
-            area_large_flag = False
-            if union_rect:
-                union_area_frac = union_rect.get_area() / page_area
-                if union_area_frac >= area_frac_min and len(drs) >= 30:
-                    area_large_flag = True
-
-            changed = False
-            out = []
-            total_len = len(raw)
-            running = 0
-            i = 0
-            while i < len(parts):
-                chunk = parts[i]
-                if i % 2 == 1:  # q..Q
-                    vector_ops = len(path_ops_re.findall(chunk))
-                    text_ops = len(text_ops_re.findall(chunk))
-                    xobj_ops = len(xobj_do_re.findall(chunk))
-                    score = vector_ops - text_ops - xobj_ops
-
-                    pos_frac = (running + len(chunk) / 2.0) / float(total_len) if total_len > 0 else 0.0
-                    near_tail = pos_frac >= stream_tail_fraction
-                    diag = has_diag_cm(chunk)
-
-                    if vector_ops >= min_vector_ops and ((diag and near_tail) or area_large_flag) and score >= min_vector_score:
-                        # Drop the overlay chunk
-                        removed += 1
-                        changed = True
-                        running += len(chunk)
-                        i += 1
-                        continue
-
-                out.append(chunk)
-                running += len(chunk)
-                i += 1
-
-            if changed:
-                new_raw = "".join(out).encode("latin-1", errors="ignore")
-                try:
-                    if isinstance(xrefs, (list, tuple)) and xrefs:
-                        page.parent.update_stream(xrefs[0], new_raw)
-                        for xr in xrefs[1:]:
-                            page.parent.update_stream(xr, b"")
+            name_to_xref = {}
+            try:
+                xobjs = page.get_xobjects()
+                # handle dict or tuple returns across PyMuPDF versions
+                for it in xobjs:
+                    if isinstance(it, dict):
+                        nm = it.get("name")
+                        xr = it.get("xref")
+                        if nm is None or xr is None:
+                            continue
+                        if isinstance(nm, bytes):
+                            nm = nm.decode("latin-1", "ignore")
+                        nm = str(nm).lstrip("/")
+                        name_to_xref[nm] = xr
                     else:
-                        page.parent.update_stream(xrefs, new_raw)
+                        nm = None; xr = None
+                        for v in it:
+                            if isinstance(v, int) and xr is None:
+                                xr = v
+                            if isinstance(v, (bytes, str)):
+                                s = v.decode("latin-1", "ignore") if isinstance(v, bytes) else v
+                                if s.startswith("/") and nm is None:
+                                    nm = s
+                        if nm and xr:
+                            name_to_xref[nm.lstrip("/")] = xr
+            except Exception:
+                pass
+
+            used_names = set(xobj_do_full.findall(raw))
+            for nm in used_names:
+                xr = name_to_xref.get(nm)
+                if not xr:
+                    continue
+                try:
+                    s = (doc.xref_stream(xr) or b"").decode("latin-1", "ignore")
                 except Exception:
-                    pass
+                    s = ""
+                if not s:
+                    continue
+                if text_ops_re.search(s):
+                    continue
+                if len(path_ops_re.findall(s)) < min_vector_ops_sample:
+                    continue
+                h = _xobject_stream_hash(doc, xr)
+                page_hashes.add((xr, h))
+            per_page_xobj_hashes.append(page_hashes)
 
-        return removed
+        hash_count = {}
+        xref_by_hash = {}
+        for ph in per_page_xobj_hashes:
+            for xr, h in ph:
+                hash_count[h] = hash_count.get(h, 0) + 1
+                xref_by_hash.setdefault(h, xr)
 
-    # ---------- SPECIFIC PHRASES + ANNOTS ----------
-    @staticmethod
-    def _remove_confidential_watermarks(doc) -> int:
+        repeated_hashes = {h for h, c in hash_count.items() if c >= hit_min}
+
         removed = 0
-        phrases = [
-            "CONFIDENTIAL INFORMATION - DO NOT DISTRIBUTE",
-            "CONFIDENTIAL INFORMATION",
-            "DO NOT DISTRIBUTE",
-            "CONFIDENTIAL",
-            "DRAFT",
-            "INTERNAL USE ONLY",
-        ]
-        up = [p.upper() for p in phrases]
 
-        # Annotations
-        for page in doc:
-            removed += WatermarkRemover._safe_delete_matching_annots(
-                page, lambda a: WatermarkRemover._annot_matches_watermark(a, up)
-            )
+        for h in repeated_hashes:
+            xr = xref_by_hash.get(h)
+            if not xr:
+                continue
+            try:
+                doc.update_stream(xr, b"")  # blank the form XObject
+                removed += 1
+            except Exception:
+                pass
 
-        # Text objects
-        for page in doc:
-            removed += WatermarkRemover._strip_text_objects(page, phrases)
+        # Stage B: repeated q..Q blocks (vector-heavy, no text), majority threshold
+        per_page_sigs = []
+        for pno in range(sample_n):
+            try:
+                page = doc.load_page(pno)
+                raw = page.read_contents().decode("latin-1", errors="ignore")
+                parts = qQ_split.split(raw)
+            except Exception:
+                per_page_sigs.append(set()); continue
+
+            page_s = set()
+            for i, chunk in enumerate(parts):
+                if i % 2 == 1:
+                    vector_ops = len(path_ops_re.findall(chunk))
+                    if vector_ops < min_vector_ops_sample:
+                        continue
+                    if text_ops_re.search(chunk):
+                        continue
+                    page_s.add(_sig(chunk))
+            per_page_sigs.append(page_s)
+
+        if per_page_sigs:
+            sig_count = {}
+            for s in per_page_sigs:
+                for sig in s:
+                    sig_count[sig] = sig_count.get(sig, 0) + 1
+            repeated_sigs = {s for s, c in sig_count.items() if c >= hit_min}
+        else:
+            repeated_sigs = set()
+
+        if repeated_sigs:
+            for pno in range(len(doc)):
+                page = doc.load_page(pno)
+                xrefs = page.get_contents()
+                if not xrefs:
+                    continue
+                try:
+                    raw = page.read_contents().decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
+                parts = qQ_split.split(raw)
+                changed = False
+                out = []
+                for i, chunk in enumerate(parts):
+                    if i % 2 == 1:
+                        sig = _sig(chunk)
+                        if sig in repeated_sigs:
+                            # ensure it's not tiny noise
+                            vops = len(path_ops_re.findall(chunk))
+                            if vops < min_vector_ops_remove:
+                                out.append(chunk); continue
+                            removed += 1
+                            changed = True
+                            continue
+                    out.append(chunk)
+                if changed:
+                    new_raw = "".join(out).encode("latin-1", errors="ignore")
+                    try:
+                        if isinstance(xrefs, (list, tuple)) and xrefs:
+                            page.parent.update_stream(xrefs[0], new_raw)
+                            for xr in xrefs[1:]:
+                                page.parent.update_stream(xr, b"")
+                        else:
+                            page.parent.update_stream(xrefs, new_raw)
+                    except Exception:
+                        pass
 
         return removed
 
-    # ---------- GENERIC REPEATING + DIAGONAL LARGE ----------
+    # ---------- Text / generic passes ----------
     @staticmethod
-    def _remove_generic_watermarks(doc) -> int:
+    def _remove_generic_watermarks(doc):
         if len(doc) < 2:
             return 0
         removed = 0
-        cands = WatermarkRemover._detect_repeating_text(doc)
-
+        cands = WatermarkRemover._detect_repeating_text_patterns(doc)
         for page in doc:
             removed += WatermarkRemover._safe_delete_matching_annots(
                 page, lambda a: WatermarkRemover._annot_matches_watermark(a, None)
             )
-
         for page in doc:
             if cands:
                 removed += WatermarkRemover._strip_text_objects(page, phrases=cands)
             removed += WatermarkRemover._strip_diagonal_large_text(page, min_pt=24, min_deg=30, max_deg=60)
-
         return removed
 
     @staticmethod
-    def _detect_repeating_text(doc):
+    def _detect_repeating_text_patterns(doc):
         sample_pages = min(5, len(doc))
         text_positions = {}
-        for i in range(sample_pages):
-            page = doc.load_page(i)
+        for page_num in range(sample_pages):
+            page = doc.load_page(page_num)
             blocks = page.get_text("dict").get("blocks", [])
-            for b in blocks:
-                if b.get("type") != 0:
-                    continue
-                for line in b.get("lines", []):
-                    for span in line.get("spans", []):
-                        t = (span.get("text") or "").strip()
-                        if len(t) < 5:
-                            continue
-                        x0, y0, x1, y1 = span.get("bbox", (0, 0, 0, 0))
-                        rx = (x0 + x1) / 2 / page.rect.width
-                        ry = (y0 + y1) / 2 / page.rect.height
-                        key = f"{rx:.2f},{ry:.2f}"
-                        text_positions.setdefault(t, {})
-                        text_positions[t][key] = text_positions[t].get(key, 0) + 1
-        return [t for t, pos in text_positions.items() if max(pos.values()) >= min(3, int(sample_pages * 0.6))]
+            for block in blocks:
+                if block.get("type") == 0:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            text = (span.get("text") or "").strip()
+                            if len(text) < 5 or text.lower() in ["the","and","or","of","to","in","for"]:
+                                continue
+                            bbox = span["bbox"]
+                            rel_x = (bbox[0] + bbox[2]) / 2 / page.rect.width
+                            rel_y = (bbox[1] + bbox[3]) / 2 / page.rect.height
+                            key = f"{rel_x:.2f},{rel_y:.2f}"
+                            text_positions.setdefault(text, {})
+                            text_positions[text][key] = text_positions[text].get(key, 0) + 1
+        cands = []
+        for text, positions in text_positions.items():
+            if max(positions.values()) >= min(3, int(sample_pages * 0.6)):
+                cands.append(text)
+        return cands
 
-    # ---------- TEXT OBJECT STRIP ----------
     @staticmethod
-    def _strip_text_objects(page, phrases) -> int:
+    def _strip_text_objects(page, phrases):
         try:
-            xrefs = page.get_contents()
-            if not xrefs:
-                return 0
-            up = [p.upper() for p in phrases if p and p.strip()]
-            if not up:
-                return 0
+            if not page.get_contents(): return 0
+            up_phrases = [p.upper() for p in phrases if p and p.strip()]
+            if not up_phrases: return 0
 
-            raw = page.read_contents().decode("latin-1", errors="ignore")
-
-            # Also strip /Artifact /Watermark marked content inside BT/ET
-            art_pat = re.compile(r"/Artifact\b[^B]*?/Watermark\b.*?BDC(.*?)EMC", re.S | re.I)
-            raw2, n_art = art_pat.subn("", raw)
+            raw = page.read_contents().decode('latin-1', errors='ignore')
+            artifact_pattern = re.compile(r"/Artifact\b[^B]*?/Watermark\b.*?BDC(.*?)EMC", re.S | re.I)
+            raw2, n_art = artifact_pattern.subn("", raw)
 
             parts = re.split(r"(BT.*?ET)", raw2, flags=re.S | re.I)
             changed = False
-            out = []
+            out_parts = []
             removed_blocks = 0
 
             tj_simple = re.compile(r"\((?:\\.|[^()])*\)\s*Tj", re.S)
-            tj_array = re.compile(r"\[\s*(?:\((?:\\.|[^()])*\)\s*-?\d+\s*)+\]\s*TJ", re.S)
+            tj_array  = re.compile(r"\[\s*(?:\((?:\\.|[^()])*\)\s*-?\d+\s*)+\]\s*TJ", re.S)
 
-            def block_matches(block_text: str) -> bool:
+            def block_has_phrase(block_text):
                 strings = []
-                strings.extend(m.group(0) for m in tj_simple.finditer(block_text))
-                strings.extend(m.group(0) for m in tj_array.finditer(block_text))
-                if not strings:
-                    return False
+                strings += [m.group(0) for m in tj_simple.finditer(block_text)]
+                strings += [m.group(0) for m in tj_array.finditer(block_text)]
+                if not strings: return False
 
                 def extract_literals(s):
                     lits = re.findall(r"\((?:\\.|[^()])*\)", s, flags=re.S)
                     out = []
                     for lit in lits:
-                        t = lit[1:-1].replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+                        t = lit[1:-1]
+                        t = t.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
                         out.append(t)
                     return " ".join(out)
 
                 merged = " ".join(extract_literals(s) for s in strings).upper()
                 merged = re.sub(r"\s+", " ", merged)
-                return any(p in merged for p in up)
+                return any(p in merged for p in up_phrases)
 
             for i, chunk in enumerate(parts):
-                if i % 2 == 1 and block_matches(chunk):
-                    removed_blocks += 1
-                    changed = True
-                    continue
-                out.append(chunk)
+                if i % 2 == 1:
+                    if block_has_phrase(chunk):
+                        removed_blocks += 1
+                        changed = True
+                        continue
+                out_parts.append(chunk)
 
             if changed or n_art:
-                new_stream = "".join(out).encode("latin-1", errors="ignore")
+                new_stream = "".join(out_parts).encode('latin-1', errors='ignore')
+                xrefs = page.get_contents()
                 if isinstance(xrefs, (list, tuple)) and xrefs:
                     page.parent.update_stream(xrefs[0], new_stream)
-                    for xr in xrefs[1:]:
-                        page.parent.update_stream(xr, b"")
+                    for x in xrefs[1:]:
+                        page.parent.update_stream(x, b"")
                 else:
                     page.parent.update_stream(xrefs, new_stream)
+
             return removed_blocks + n_art
         except Exception:
             return 0
 
-    # ---------- DIAGONAL LARGE TEXT ----------
     @staticmethod
-    def _strip_diagonal_large_text(page, min_pt=24, min_deg=30, max_deg=60) -> int:
+    def _strip_diagonal_large_text(page, min_pt=24, min_deg=30, max_deg=60):
         removed = 0
         try:
             text = page.get_text("dict")
-            if not text:
+            if not text or "blocks" not in text:
                 return 0
-
-            has_diag_large = False
+            has_candidates = False
             for block in text.get("blocks", []):
-                if block.get("type") != 0:
-                    continue
+                if block.get("type") != 0: continue
                 for line in block.get("lines", []):
                     d = line.get("dir")
-                    if not d:
-                        continue
-                    ang = abs(math.degrees(math.atan2(d[1], d[0])))
-                    if min_deg <= ang <= max_deg and any(span.get("size", 0) >= min_pt for span in line.get("spans", [])):
-                        has_diag_large = True
-                        break
-                if has_diag_large:
-                    break
-            if not has_diag_large:
-                return 0
+                    if not d: continue
+                    angle = abs(math.degrees(math.atan2(d[1], d[0])))
+                    if not (min_deg <= angle <= max_deg): continue
+                    if any(span.get("size", 0) >= min_pt for span in line.get("spans", [])):
+                        has_candidates = True; break
+                if has_candidates: break
+            if not has_candidates: return 0
 
-            xrefs = page.get_contents()
-            if not xrefs:
-                return 0
-            raw = page.read_contents().decode("latin-1", errors="ignore")
+            raw = page.read_contents().decode('latin-1', errors='ignore')
             parts = re.split(r"(BT.*?ET)", raw, flags=re.S | re.I)
-            changed = False
-            out = []
+            changed = False; out_parts = []
+
+            tm_rot = re.compile(r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm", re.I)
+            tf_big = re.compile(r"/[A-Za-z0-9]+\s+(\d{2,})\s+Tf", re.I)
 
             for i, chunk in enumerate(parts):
                 if i % 2 == 1:
-                    if "Tj" in chunk or "TJ" in chunk:
-                        removed += 1
-                        changed = True
-                        continue
-                out.append(chunk)
+                    has_big = any(float(s) >= min_pt for s in tf_big.findall(chunk))
+                    rot_hit = False
+                    for a,b,c,d,_,_ in tm_rot.findall(chunk):
+                        try:
+                            a,b,c,d = float(a), float(b), float(c), float(d)
+                            ang = abs(math.degrees(math.atan2(b, a)))
+                            if min_deg <= ang <= max_deg:
+                                rot_hit = True; break
+                        except:
+                            pass
+                    if has_big and rot_hit:
+                        removed += 1; changed = True; continue
+                out_parts.append(chunk)
 
             if changed:
-                new_stream = "".join(out).encode("latin-1", errors="ignore")
+                new_stream = "".join(out_parts).encode('latin-1', errors='ignore')
+                xrefs = page.get_contents()
                 if isinstance(xrefs, (list, tuple)) and xrefs:
                     page.parent.update_stream(xrefs[0], new_stream)
-                    for xr in xrefs[1:]:
-                        page.parent.update_stream(xr, b"")
+                    for x in xrefs[1:]:
+                        page.parent.update_stream(x, b"")
                 else:
                     page.parent.update_stream(xrefs, new_stream)
             return removed
         except Exception:
             return 0
 
-    # ---------- ARTIFACT-TAGGED ----------
     @staticmethod
-    def _remove_artifact_watermarks(doc) -> int:
-        removed = 0
-        for page in doc:
-            page.clean_contents()
-            xref = page.get_contents()[0] if page.get_contents() else None
-            if not xref:
-                continue
-            try:
-                lines = page.read_contents().splitlines()
-                out = []
-                skipping = False
-                for ln in lines:
-                    s = ln.decode("latin-1", errors="ignore")
-                    if "/Artifact" in s and "/Watermark" in s:
-                        skipping = True
-                        removed += 1
-                        continue
-                    if skipping and "EMC" in s:
-                        skipping = False
-                        continue
-                    if not skipping:
-                        out.append(ln)
-                if len(out) != len(lines):
-                    page.parent.update_stream(xref, b"\n".join(out))
-            except Exception:
-                pass
-        return removed
-
-    # ---------- ANNOTATIONS ----------
-    @staticmethod
-    def _safe_delete_matching_annots(page, predicate) -> int:
+    def _safe_delete_matching_annots(page, predicate):
         removed = 0
         try:
             annot = page.first_annot
         except Exception:
             annot = None
-
         while annot:
             try:
-                nxt = annot.next
+                next_annot = annot.next
             except Exception:
-                nxt = None
+                next_annot = None
             try:
                 if predicate(annot):
                     try:
@@ -452,18 +436,21 @@ class WatermarkRemover:
                         pass
             except Exception:
                 pass
-            annot = nxt
+            annot = next_annot
         return removed
 
     @staticmethod
-    def _annot_matches_watermark(annot, phrases_upper=None) -> bool:
+    def _annot_matches_watermark(annot, phrases_upper=None):
         try:
             t = (annot.type[1] or "").upper()
         except Exception:
             t = ""
-        info = getattr(annot, "info", {}) or {}
-        contents = str(info.get("content", "")).upper()
-        name = str(info.get("name", "")).upper()
+        try:
+            info = annot.info or {}
+        except Exception:
+            info = {}
+        contents = str(info.get("content", "") or "").upper()
+        name = str(info.get("name", "") or "").upper()
         if t in {"STAMP", "WATERMARK"}:
             return True
         if phrases_upper:
@@ -472,337 +459,352 @@ class WatermarkRemover:
                     return True
         return False
 
-
-# ------------------------------
-# Background worker
-# ------------------------------
-class ProcessorThread(threading.Thread):
-    def __init__(self, files, opts, ui_callback, done_callback, cancel_flag):
-        super().__init__(daemon=True)
-        self.files = files
-        self.opts = opts
-        self.ui_callback = ui_callback
-        self.done_callback = done_callback
-        self.cancel_flag = cancel_flag
-        self.processed = []
-
-    def run(self):
-        total = len(self.files)
-        for i, src in enumerate(self.files, 1):
-            if self.cancel_flag.is_set():
-                break
-            name = os.path.basename(src)
-            out = str(Path(src).parent / f"(No Watermarks) {Path(src).name}")
-
-            def status(msg):
-                self.ui_callback(("status", f"{msg}"))
-
-            try:
-                self.ui_callback(("status", f"Processing {name}…"))
-                n = WatermarkRemover.remove_watermarks(
-                    src, out,
-                    remove_confidential=self.opts["confidential"],
-                    remove_generic=self.opts["generic"],
-                    handle_vector=self.opts["vector"],
-                    status_cb=status
-                )
-                self.processed.append((src, out))
-                self.ui_callback(("log", f"✅ {name} → removed ~{n} watermark elements\n    ↳ {os.path.basename(out)}"))
-            except Exception as e:
-                self.ui_callback(("log", f"❌ {name}: {e}"))
-
-            pct = int(i / total * 100)
-            self.ui_callback(("progress", pct))
-
-            # For the first processed file, request preview update
-            if i == 1 and not self.cancel_flag.is_set():
-                self.ui_callback(("preview-final", (src, out)))
-
-        self.done_callback(self.processed)
+    @staticmethod
+    def _remove_artifact_watermarks(doc):
+        removed_count = 0
+        for page in doc:
+            page.clean_contents()
+            xref = page.get_contents()[0] if page.get_contents() else None
+            if xref:
+                try:
+                    content_lines = page.read_contents().splitlines()
+                    modified_lines = []
+                    skip_until_emc = False
+                    for line in content_lines:
+                        line_str = line.decode('latin-1', errors='ignore')
+                        if '/Artifact' in line_str and '/Watermark' in line_str:
+                            skip_until_emc = True
+                            removed_count += 1
+                            continue
+                        if skip_until_emc and 'EMC' in line_str:
+                            skip_until_emc = False
+                            continue
+                        if not skip_until_emc:
+                            modified_lines.append(line)
+                    if len(modified_lines) != len(content_lines):
+                        page.parent.update_stream(xref, b'\n'.join(modified_lines))
+                except Exception:
+                    pass
+        return removed_count
 
 
-# ------------------------------
-# Tkinter GUI
-# ------------------------------
-class App(Tk):
+# --------------------------- GUI (Tkinter) ---------------------------
+
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PDF Watermark Remover Lite by Emil Ferdman (With Help from ChatGPT")
-        self.geometry("1100x720")
+        self.title(APP_TITLE)
+        self.geometry("1100x750")
+        try:
+            self.iconbitmap(default='')  # no-op if missing
+        except Exception:
+            pass
 
         # State
-        self.files = []
-        self.preview_imgs = {"orig": None, "proc": None}
-        self.preview_paths = {"orig": None, "proc": None}
+        self.current_files = []
+        self.processed_files = []
+        self.preview_photo_orig = None
+        self.preview_photo_proc = None
+        self.preview_tmpfile = None
         self.worker = None
-        self.cancel_flag = threading.Event()
-        self.ui_queue = queue.Queue()
+        self.queue = queue.Queue()
 
-        # Options
-        self.var_confidential = BooleanVar(value=True)
-        self.var_generic = BooleanVar(value=True)
-        self.var_vector = BooleanVar(value=True)
-
+        # UI
         self._build_ui()
-        self._poll_ui_queue()
+        self._poll_queue()
 
-    # ---------- UI Layout ----------
+    # ---- UI Layout ----
     def _build_ui(self):
-        # Top bar
-        top = Frame(self); top.pack(side=TOP, fill=X, padx=10, pady=10)
+        # Title
+        title = ttk.Label(self, text="PDF Watermark Removal Tool (Lite)", anchor="center")
+        title.configure(font=("Segoe UI", 18, "bold"))
+        title.pack(pady=10)
 
-        Label(top, text="Watermark Removal Settings", font=("Segoe UI", 12, "bold")).pack(side=LEFT, padx=(0, 20))
-        Checkbutton(top, text="Remove 'CONFIDENTIAL' phrases", variable=self.var_confidential).pack(side=LEFT, padx=5)
-        Checkbutton(top, text="Auto-detect repeating/diagonal", variable=self.var_generic).pack(side=LEFT, padx=5)
-        Checkbutton(top, text="Handle vector/object overlays", variable=self.var_vector).pack(side=LEFT, padx=5)
+        # Settings
+        frame_settings = ttk.LabelFrame(self, text="Watermark Removal Settings")
+        frame_settings.pack(fill="x", padx=20, pady=10)
 
-        # Middle: left (controls/log) and right (preview)
-        mid = Frame(self); mid.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        self.var_generic = tk.BooleanVar(value=True)
+        self.var_vector = tk.BooleanVar(value=True)
 
-        # Left panel
-        left = Frame(mid); left.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
+        chk_generic = ttk.Checkbutton(frame_settings, text="Auto-detect and remove repeating text watermarks", variable=self.var_generic, command=self._on_settings_changed)
+        chk_vector  = ttk.Checkbutton(frame_settings, text="Handle vector/object-based watermarks (path overlays)", variable=self.var_vector, command=self._on_settings_changed)
+        chk_generic.pack(side="left", padx=10, pady=8)
+        chk_vector.pack(side="left", padx=10, pady=8)
 
-        # File controls
-        ctrl = Frame(left); ctrl.pack(fill=X)
-        Button(ctrl, text="Select PDFs…", command=self.on_select_files).pack(side=LEFT)
-        Button(ctrl, text="Start", command=self.on_start, state="disabled", name="startbtn").pack(side=LEFT, padx=6)
-        Button(ctrl, text="Cancel", command=self.on_cancel, state="disabled", name="cancelbtn").pack(side=LEFT)
-        self.progress_var = StringVar(value="0%")
-        self.progress_lbl = Label(ctrl, textvariable=self.progress_var); self.progress_lbl.pack(side=RIGHT)
+        # Main Split
+        frame_main = ttk.Frame(self)
+        frame_main.pack(fill="both", expand=True, padx=20, pady=10)
+        frame_left = ttk.Frame(frame_main)
+        frame_right = ttk.Frame(frame_main)
+        frame_left.pack(side="left", fill="both", expand=True)
+        frame_right.pack(side="left", fill="both", expand=True)
 
-        # Status
-        self.status_var = StringVar(value="Ready.")
-        Label(left, textvariable=self.status_var, fg="#2e7d32").pack(fill=X, pady=(6, 4))
+        # Left controls
+        lf_select = ttk.LabelFrame(frame_left, text="Select PDFs")
+        lf_select.pack(fill="x", pady=8)
+        self.lbl_drop = ttk.Label(lf_select, text="No files selected.")
+        self.lbl_drop.pack(side="left", padx=10, pady=8)
+        btn_browse = ttk.Button(lf_select, text="Browse…", command=self._select_files)
+        btn_browse.pack(side="right", padx=10, pady=8)
 
-        # Log area
-        log_frame = Frame(left); log_frame.pack(fill=BOTH, expand=True)
-        self.log_text = Text(log_frame, height=18, wrap="word")
-        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
-        sb = Scrollbar(log_frame, command=self.log_text.yview)
-        sb.pack(side=RIGHT, fill=Y)
-        self.log_text.config(yscrollcommand=sb.set)
+        lf_progress = ttk.LabelFrame(frame_left, text="Processing")
+        lf_progress.pack(fill="x", pady=8)
+        self.progress = ttk.Progressbar(lf_progress, orient="horizontal", mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=10, pady=10)
+        frm_btns = ttk.Frame(lf_progress); frm_btns.pack(fill="x", padx=10, pady=4)
+        self.btn_start = ttk.Button(frm_btns, text="Start Processing", command=self._start_processing, state="disabled")
+        self.btn_cancel = ttk.Button(frm_btns, text="Cancel", command=self._cancel_processing, state="disabled")
+        self.btn_start.pack(side="left", padx=4)
+        self.btn_cancel.pack(side="left", padx=4)
 
-        # Right panel: Preview
-        right = Frame(mid, bd=1, relief="sunken"); right.pack(side=RIGHT, fill=BOTH, expand=True)
+        self.lbl_status = ttk.Label(frame_left, text="Ready.")
+        self.lbl_status.pack(fill="x", pady=6, padx=2)
 
-        Label(right, text="Preview (page 1)", font=("Segoe UI", 12, "bold")).pack(anchor=W, padx=8, pady=(8, 0))
-        pv = Frame(right); pv.pack(fill=BOTH, expand=True, padx=8, pady=8)
+        lf_log = ttk.LabelFrame(frame_left, text="Log")
+        lf_log.pack(fill="both", expand=True)
+        self.txt_log = tk.Text(lf_log, height=12, wrap="word")
+        self.txt_log.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # Original
-        self.orig_label = Label(pv, text="Original will appear here", bd=1, relief="groove", width=45, height=28, anchor="center")
-        self.orig_label.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 6))
-        self.orig_label.bind("<Button-1>", lambda e: self._open_preview_pdf("orig"))
+        # Right previews
+        lf_preview = ttk.LabelFrame(frame_right, text="Preview (first page)")
+        lf_preview.pack(fill="both", expand=True, padx=0, pady=0)
 
-        # Processed
-        self.proc_label = Label(pv, text="Processed will appear here", bd=1, relief="groove", width=45, height=28, anchor="center")
-        self.proc_label.pack(side=RIGHT, fill=BOTH, expand=True, padx=(6, 0))
-        self.proc_label.bind("<Button-1>", lambda e: self._open_preview_pdf("proc"))
+        top = ttk.Frame(lf_preview); top.pack(fill="x")
+        ttk.Label(top, text="Original").pack(side="left", padx=10, pady=6)
+        ttk.Label(top, text="Processed").pack(side="right", padx=10, pady=6)
 
-    # ---------- Events ----------
-    def on_select_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Select PDF files", filetypes=[("PDF files", "*.pdf")]
-        )
-        if not paths:
+        body = ttk.Frame(lf_preview); body.pack(fill="both", expand=True)
+        self.canvas_orig = tk.Label(body, anchor="center", relief="groove")
+        self.canvas_proc = tk.Label(body, anchor="center", relief="groove")
+        self.canvas_orig.place(relx=0.02, rely=0.08, width=PREVIEW_W, height=PREVIEW_H)
+        self.canvas_proc.place(relx=0.55, rely=0.08, width=PREVIEW_W, height=PREVIEW_H)
+
+        bottom = ttk.Frame(lf_preview); bottom.pack(fill="x")
+        self.btn_open_orig = ttk.Button(bottom, text="Open Original", command=self._open_original, state="disabled")
+        self.btn_open_proc = ttk.Button(bottom, text="Open Processed", command=self._open_processed, state="disabled")
+        self.btn_open_orig.pack(side="left", padx=10, pady=6)
+        self.btn_open_proc.pack(side="right", padx=10, pady=6)
+
+    # ---- Event handlers ----
+    def _select_files(self):
+        files = filedialog.askopenfilenames(title="Select PDF Files", filetypes=[("PDF Files","*.pdf")])
+        if not files:
             return
-        self.files = list(paths)
-        self._log(f"Selected {len(self.files)} PDF(s):")
-        for p in self.files[:10]:
-            self._log("  • " + os.path.basename(p))
-        if len(self.files) > 10:
-            self._log(f"  ... and {len(self.files) - 10} more")
+        self.current_files = list(files)
+        self.processed_files = []
+        self._log(f"Selected {len(files)} file(s).")
+        self.lbl_drop.config(text=f"{len(files)} file(s) selected.")
+        self.btn_start.config(state="normal")
+        self.lbl_status.config(text=f"Ready to process {len(files)} file(s).")
 
-        self._set_status(f"Ready to process {len(self.files)} file(s)")
-        self._set_btn_state("startbtn", True)
-        self._set_btn_state("cancelbtn", False)
-        self._set_progress(0)
-
-        # Preview policy
-        if len(self.files) == 1:
-            self._make_preview(self.files[0])
+        if len(files) == 1:
+            # show original preview and start processed preview
+            self._render_preview(self.current_files[0], which="orig")
+            self._refresh_preview()
         else:
             self._clear_preview("Preview disabled when multiple PDFs are selected.")
 
-    def on_start(self):
-        if not self.files:
+    def _on_settings_changed(self):
+        # Requirement: clear preview first, then refresh
+        self._clear_preview("Refreshing preview…")
+        self._refresh_preview()
+
+    def _start_processing(self):
+        if not self.current_files:
             return
-        self.cancel_flag.clear()
-        self._set_btn_state("startbtn", False)
-        self._set_btn_state("cancelbtn", True)
-        self._set_progress(0)
-
-        opts = dict(
-            confidential=self.var_confidential.get(),
-            generic=self.var_generic.get(),
-            vector=self.var_vector.get()
-        )
+        self.btn_start.config(state="disabled")
+        self.btn_cancel.config(state="normal")
+        self.progress["value"] = 0
         self._log("\n--- Processing Started ---")
+        self._set_status("Processing…")
 
-        def ui_callback(msg):
-            # msg is a tuple like ("status", text) or ("progress", pct) ...
-            self.ui_queue.put(msg)
+        t = threading.Thread(target=self._worker_process, daemon=True)
+        self.worker = t
+        t.start()
 
-        def done_callback(processed):
-            # Called in worker thread at the end
-            self.ui_queue.put(("done", processed))
+    def _cancel_processing(self):
+        # Best-effort: we don't kill threads; we just mark intent and stop queuing further tasks
+        self._set_status("Cancel requested (will stop after current file).")
+        self.worker = None  # signal to worker loop
 
-        self.worker = ProcessorThread(self.files, opts, ui_callback, done_callback, self.cancel_flag)
-        self.worker.start()
+    def _open_original(self):
+        if self.current_files:
+            open_file_cross_platform(self.current_files[0])
 
-    def on_cancel(self):
-        if self.worker and self.worker.is_alive():
-            self.cancel_flag.set()
-            self._set_btn_state("cancelbtn", False)
-            self._set_status("Cancelling…")
+    def _open_processed(self):
+        if self.processed_files:
+            open_file_cross_platform(self.processed_files[0][1])
 
-    # ---------- Preview helpers ----------
-    def _make_preview(self, pdf_path):
-        """Generate preview by processing to a temp PDF and rendering page 1 PNGs via PyMuPDF."""
-        self._clear_preview("Generating preview…")
+    # ---- Worker threads ----
+    def _worker_process(self):
+        files = self.current_files[:]
+        total = len(files)
+        processed = []
+        for i, pdf in enumerate(files):
+            if self.worker is None:
+                break
+            try:
+                in_path = Path(pdf)
+                out_path = in_path.parent / f"(No Watermarks) {in_path.name}"
+                def _status(msg):
+                    self.queue.put(("status", msg))
+                WatermarkRemover.remove_watermarks(
+                    str(in_path), str(out_path),
+                    remove_generic=self.var_generic.get(),
+                    handle_vector=self.var_vector.get(),
+                    status_cb=_status
+                )
+                processed.append((str(in_path), str(out_path)))
+                self.queue.put(("file_done", (str(in_path), str(out_path))))
+                if i == 0 and len(files) >= 1:
+                    self.queue.put(("preview_ready", (str(in_path), str(out_path))))
+            except Exception as e:
+                self.queue.put(("error", (pdf, f"Processing error: {e}")))
+            self.queue.put(("progress", int(((i + 1) / total) * 100)))
+
+        self.queue.put(("complete", processed))
+
+    def _worker_preview(self, in_file, out_file):
         try:
-            base = os.path.basename(pdf_path)
-            tmp_proc = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {base}")
-
-            # Run with current options
-            opts = dict(
-                remove_confidential=self.var_confidential.get(),
+            def _status(msg):
+                self.queue.put(("status", f"[Preview] {msg}"))
+            WatermarkRemover.remove_watermarks(
+                in_file, out_file,
                 remove_generic=self.var_generic.get(),
                 handle_vector=self.var_vector.get(),
+                status_cb=_status
             )
-            WatermarkRemover.remove_watermarks(pdf_path, tmp_proc, **opts, status_cb=lambda msg: None)
-
-            # Render original & processed page 1 to temp PNGs
-            orig_png = self._render_page_to_png(pdf_path)
-            proc_png = self._render_page_to_png(tmp_proc)
-
-            self.preview_paths["orig"] = pdf_path
-            self.preview_paths["proc"] = tmp_proc
-
-            if PhotoImage:
-                if orig_png and os.path.exists(orig_png):
-                    self.preview_imgs["orig"] = PhotoImage(file=orig_png)
-                    self.orig_label.config(image=self.preview_imgs["orig"], text="")
-                else:
-                    self.orig_label.config(image="", text="Original preview unavailable")
-
-                if proc_png and os.path.exists(proc_png):
-                    self.preview_imgs["proc"] = PhotoImage(file=proc_png)
-                    self.proc_label.config(image=self.preview_imgs["proc"], text="")
-                else:
-                    self.proc_label.config(image="", text="Processed preview unavailable")
-            else:
-                self.orig_label.config(text="Preview requires Tk PhotoImage support")
-                self.proc_label.config(text="Preview requires Tk PhotoImage support")
+            self.queue.put(("preview_done", (in_file, out_file)))
         except Exception as e:
-            self._clear_preview(f"Preview error: {e}")
+            self.queue.put(("preview_error", (in_file, f"Preview error: {e}")))
 
-    def _render_page_to_png(self, pdf_path, page_index=0, scale=1.5):
-        """Use PyMuPDF to render a page to a temp PNG file."""
-        try:
-            doc = fitz.open(pdf_path)
-            if page_index >= len(doc):
-                page_index = 0
-            page = doc.load_page(page_index)
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-            out = os.path.join(tempfile.gettempdir(), f"__preview_{os.path.basename(pdf_path)}_{page_index}.png")
-            pix.save(out)
-            doc.close()
-            return out
-        except Exception:
-            return None
-
-    def _open_preview_pdf(self, which):
-        path = self.preview_paths.get(which)
-        if path:
-            open_file_cross_platform(path)
-
-    def _clear_preview(self, msg="Preview will appear here"):
-        self.preview_imgs["orig"] = None
-        self.preview_imgs["proc"] = None
-        self.preview_paths["orig"] = None
-        self.preview_paths["proc"] = None
-        self.orig_label.config(image="", text=msg)
-        self.proc_label.config(image="", text=msg)
-
-    # ---------- UI helpers ----------
-    def _set_btn_state(self, name, enable: bool):
-        try:
-            btn = self.nametowidget(name)
-            btn.config(state=("normal" if enable else "disabled"))
-        except Exception:
-            pass
-
-    def _set_status(self, text):
-        self.status_var.set(text)
-
-    def _set_progress(self, pct: int):
-        self.progress_var.set(f"{pct}%")
-
-    def _log(self, text: str):
-        self.log_text.insert("end", text + "\n")
-        self.log_text.see("end")
-
-    # ---------- UI queue polling (thread-safe updates) ----------
-    def _poll_ui_queue(self):
+    # ---- Queue / UI updates ----
+    def _poll_queue(self):
         try:
             while True:
-                msg = self.ui_queue.get_nowait()
-                kind, payload = msg[0], msg[1] if len(msg) > 1 else None
+                kind, payload = self.queue.get_nowait()
                 if kind == "status":
                     self._set_status(payload)
                 elif kind == "progress":
-                    self._set_progress(int(payload))
-                elif kind == "log":
-                    self._log(payload)
-                elif kind == "preview-final":
-                    # Update right-side processed with first finished output
-                    src, out = payload
-                    self.preview_paths["orig"] = src
-                    self.preview_paths["proc"] = out
-                    # Refresh processed image only (optional)
-                    proc_png = self._render_page_to_png(out)
-                    if proc_png and PhotoImage:
-                        self.preview_imgs["proc"] = PhotoImage(file=proc_png)
-                        self.proc_label.config(image=self.preview_imgs["proc"], text="")
-                elif kind == "done":
-                    processed = payload or []
-                    self._on_done(processed)
+                    self.progress["value"] = payload
+                elif kind == "file_done":
+                    in_path, out_path = payload
+                    self.processed_files.append((in_path, out_path))
+                    self._log(f"✅ Processed: {os.path.basename(in_path)}")
+                    self._log(f"   Output: {os.path.basename(out_path)}")
+                elif kind == "preview_ready":
+                    in_path, out_path = payload
+                    # update processed side preview
+                    self._render_preview(in_path, which="orig")
+                    self._render_preview(out_path, which="proc")
+                elif kind == "complete":
+                    processed = payload
+                    self._on_complete(processed)
+                elif kind == "error":
+                    f, err = payload
+                    self._log(f"❌ Error processing {os.path.basename(f)}: {err}")
+                elif kind == "preview_done":
+                    in_path, out_path = payload
+                    self._render_preview(in_path, which="orig")
+                    self._render_preview(out_path, which="proc")
+                elif kind == "preview_error":
+                    f, err = payload
+                    self._log(f"❌ {err}")
+                else:
+                    pass
         except queue.Empty:
             pass
-        self.after(80, self._poll_ui_queue)
+        self.after(60, self._poll_queue)
 
-    def _on_done(self, processed):
-        self._set_btn_state("startbtn", True)
-        self._set_btn_state("cancelbtn", False)
-        self._set_progress(100)
-
-        succ = len(processed)
-        total = len(self.files)
+    def _on_complete(self, processed_files):
+        self.btn_start.config(state="normal")
+        self.btn_cancel.config(state="disabled")
+        self.progress["value"] = 100
+        success = len(processed_files)
+        total = len(self.current_files)
         self._log("\n--- Processing Complete ---")
-        self._log(f"Successfully processed: {succ}/{total} files")
-        if processed:
+        self._log(f"Successfully processed: {success}/{total} files")
+        if processed_files:
             self._log("\nOutput files saved:")
-            for _, out in processed:
-                self._log(f"  • {os.path.basename(out)}")
-        self._set_status(f"Complete! Processed {succ}/{total} files")
+            for _, outp in processed_files:
+                self._log(f"  • {os.path.basename(outp)}")
+        self._set_status(f"Complete! Processed {success}/{total} files")
+        if success > 0:
+            messagebox.showinfo("Processing Complete",
+                                f"Successfully processed {success} out of {total} PDF files.\n\n"
+                                f"Processed files are saved with '(No Watermarks)' prefix in the same directory.")
+        if success > 1:
+            if messagebox.askyesno("Open All Processed PDFs", "Open all processed PDFs now?"):
+                for _, outp in processed_files:
+                    open_file_cross_platform(outp)
 
-        if succ > 0:
-            messagebox.showinfo(
-                "Processing Complete",
-                f"Successfully processed {succ} out of {total} PDF files.\n\n"
-                f"Processed files are saved with '(No Watermarks) ' prefix next to the originals."
-            )
+    # ---- Preview helpers ----
+    def _clear_preview(self, msg=""):
+        # Clear first (requirement)
+        self.canvas_orig.config(image="", text=msg)
+        self.canvas_proc.config(image="", text=msg)
+        self.preview_photo_orig = None
+        self.preview_photo_proc = None
+        self.btn_open_orig.config(state="disabled")
+        self.btn_open_proc.config(state="disabled")
 
-        if succ > 1:
-            if messagebox.askyesno("Open All Processed PDFs", "Would you like to open all processed PDFs now?"):
-                for _, out_path in processed:
-                    open_file_cross_platform(out_path)
+    def _refresh_preview(self):
+        if len(self.current_files) != 1:
+            return
+        in_file = self.current_files[0]
+        self.preview_tmpfile = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {os.path.basename(in_file)}")
+        # kick background preview
+        t = threading.Thread(target=self._worker_preview, args=(in_file, self.preview_tmpfile), daemon=True)
+        t.start()
+
+    def _pix_to_photoimage(self, pix: fitz.Pixmap):
+        # Use PNG bytes -> base64 -> PhotoImage(data=...)
+        png_bytes = pix.tobytes("png")
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        return tk.PhotoImage(data=b64)
+
+    def _render_preview(self, pdf_path, which="orig", page_num=0):
+        if not pdf_path or not os.path.exists(pdf_path):
+            return
+        try:
+            doc = fitz.open(pdf_path)
+            if page_num >= len(doc): page_num = 0
+            page = doc.load_page(page_num)
+            mat = fitz.Matrix(1.5, 1.5)
+            pix = page.get_pixmap(matrix=mat)
+            photo = self._pix_to_photoimage(pix)
+            doc.close()
+        except Exception:
+            return
+
+        if which == "orig":
+            self.preview_photo_orig = photo
+            self.canvas_orig.config(image=self.preview_photo_orig, text="")
+            self.btn_open_orig.config(state="normal")
+        else:
+            self.preview_photo_proc = photo
+            self.canvas_proc.config(image=self.preview_photo_proc, text="")
+            self.btn_open_proc.config(state="normal")
+
+    # ---- Misc helpers ----
+    def _set_status(self, text):
+        self.lbl_status.config(text=text)
+
+    def _log(self, text):
+        self.txt_log.insert("end", text + "\n")
+        self.txt_log.see("end")
 
 
-# ------------------------------
-# Main
-# ------------------------------
 def main():
+    # Basic HiDPI fix for Windows
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore
+        except Exception:
+            pass
+
     app = App()
     app.mainloop()
 

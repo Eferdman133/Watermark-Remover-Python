@@ -1,6 +1,6 @@
 # Professional PDF Watermark Removal Application
 # (Non-destructive + Safe Annot Deletion + Smart Preview + Open-All-When-Done)
-# New: Optional handling for vector/object-based watermarks (path-heavy overlays).
+# Vector/object watermarks: samples first 5 pages for identical overlays (XObject hashing + q..Q majority) & deletes those across all pages.
 
 import sys
 import os
@@ -8,6 +8,7 @@ import math
 import re
 import subprocess
 import platform
+import hashlib
 from pathlib import Path
 import tempfile
 
@@ -43,9 +44,8 @@ class WatermarkRemover:
 
     @staticmethod
     def remove_watermarks(input_path, output_path,
-                          remove_confidential=True,
                           remove_generic=True,
-                          handle_vector=False,
+                          handle_vector=True,
                           status_cb=None):
         try:
             doc = fitz.open(input_path)
@@ -54,22 +54,17 @@ class WatermarkRemover:
 
             total_removed = 0
 
-            # 0) Optional: vector/object watermark handler (path-heavy overlays)
+            # Vector/object watermark handler (repeated overlays across pages)
             if handle_vector:
-                if status_cb: status_cb("Scanning for vector/object-based watermarks…")
+                if status_cb: status_cb("Scanning for repeated vector/object watermarks…")
                 total_removed += WatermarkRemover._remove_vector_object_watermarks(doc)
 
-            # 1) Specific phrases + safe annot deletion
-            if remove_confidential:
-                if status_cb: status_cb("Removing specific 'CONFIDENTIAL' watermarks…")
-                total_removed += WatermarkRemover._remove_confidential_watermarks(doc)
-
-            # 2) Generic repeating + diagonal big text
+            # Generic repeating + diagonal big text
             if remove_generic:
-                if status_cb: status_cb("Detecting & removing generic repeating watermarks…")
+                if status_cb: status_cb("Detecting & removing generic repeating text watermarks…")
                 total_removed += WatermarkRemover._remove_generic_watermarks(doc)
 
-            # 3) Artifact-marked content
+            # Artifact-marked content
             if status_cb: status_cb("Cleaning artifact-based watermark blocks…")
             total_removed += WatermarkRemover._remove_artifact_watermarks(doc)
 
@@ -79,171 +74,209 @@ class WatermarkRemover:
         except Exception:
             raise
 
-    # ---------- VECTOR / OBJECT-BASED WATERMARK PASS ----------
+    # ---------- VECTOR / OBJECT-BASED WATERMARK (XObject hashing + q..Q majority) ----------
     @staticmethod
-    def _remove_vector_object_watermarks(doc,
-                                         stream_tail_fraction=0.70,
-                                         min_vector_ops=0,
-                                         min_vector_score=0,
-                                         angle_min=20, angle_max=80,
-                                         area_frac_min=0.0):
+    def _remove_vector_object_watermarks(
+        doc,
+        sample_pages=5,
+        min_vector_ops_sample=5,
+        min_vector_ops_remove=5,
+        repeat_threshold=0.8,        # appear on ≥ 80% of sampled pages
+    ):
         """
-        Heuristic removal of vector (path) overlays typically used for outline watermarks:
-        - Split each page stream into q..Q chunks (graphics state groups).
-        - Score each chunk:
-            * path_ops = count of path operators (m,l,c,re,h,S,s,f,f*,B,B*,b,b*)
-            * has_diagonal = a 'cm' rotation ≈ 20–70 degrees (or -20..-70)
-            * near_tail    = chunk appears in last 30% of the page stream
-            * area_large   = union bbox of paths covers >= area_frac_min of the page (via page.get_drawings)
-              (approximate: if many drawings exist and union bbox is large)
-        - If (path_ops >= min_vector_ops) AND ((has_diagonal and near_tail) OR area_large)
-          => remove that q..Q chunk from the content stream.
+        Two-stage remover:
+          A) XObject-based: hash form XObject streams used on the first N pages.
+             If the same XObject content appears on ≥ threshold of those pages,
+             blank that XObject's stream (removes all placements anywhere).
+          B) q..Q-block-based: repeated vector-heavy, no-text graphics-state blocks,
+             decided by majority threshold, then removed across the whole doc.
         """
-        removed = 0
+        if len(doc) == 0:
+            return 0
 
-        # Precompute drawing info (vector outlines) to estimate large-area overlays
-        drawings_cache = []
-        for pno in range(len(doc)):
+        # --- helpers / regex ---
+        qQ_split      = re.compile(r"(q.*?Q)", re.S)
+        text_ops_re   = re.compile(r"BT|Tj|TJ", re.I)
+        path_ops_re   = re.compile(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\*?|B\*?|b\*?|W\*?|W|n|cm)(?![A-Za-z])")
+        xobj_do_full  = re.compile(r"/([A-Za-z0-9_.#-]+)\s+Do")
+        opseq_re      = re.compile(r"(?<![A-Za-z])(?:q|Q|cm|m|l|c|re|h|S|s|f\*?|B\*?|b\*?|W\*?|W|n|Do|gs|sh|SCN?|scn?)(?![A-Za-z])")
+        num_re        = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+        sample_n = min(sample_pages, len(doc))
+        hit_min  = max(1, int(round(sample_n * repeat_threshold)))
+
+        def _sig(chunk: str) -> str:
+            opseq = " ".join(opseq_re.findall(chunk))
+            norm  = num_re.sub("<n>", chunk)
+            norm  = re.sub(r"\s+", " ", norm)
+            return hashlib.sha1((opseq + "|" + norm).encode("utf-8", "ignore")).hexdigest()
+
+        # ---------- Stage A: find repeated XObjects by content hash ----------
+        per_page_xobj_hashes = []
+
+        def _xobject_stream_hash(doc, xref):
             try:
-                page = doc.load_page(pno)
-                drs = page.get_drawings()  # list of path objects with 'rect', 'items', 'fill', 'stroke'...
+                data = doc.xref_stream(xref) or b""
             except Exception:
-                drs = []
-            union = None
-            for d in drs:
-                r = d.get("rect")
-                if not r:
-                    # try to build from points
-                    pts = []
-                    for it in d.get("items", []):
-                        for seg in it:
-                            if isinstance(seg, fitz.Point):
-                                pts.append(seg)
-                    if pts:
-                        xs = [p.x for p in pts]
-                        ys = [p.y for p in pts]
-                        r = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
-                if r:
-                    union = r if union is None else union | r
-            drawings_cache.append((drs, union))
+                data = b""
+            return hashlib.sha1(b"%d|" % len(data) + data[:4096] + b"|" + data[-4096:]).hexdigest()
 
-        # Regex helpers
-        qQ_split = re.compile(r"(q.*?Q)", re.S)
-        path_ops_re = re.compile(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\*?|B\*?|b\*?)(?![A-Za-z])")
-        text_ops_re = re.compile(r"BT|Tj|TJ")
-        xobj_do_re = re.compile(r"/[A-Za-z0-9_.#-]+\s+Do")
-        cm_re = re.compile(r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+cm")
-
-        def _has_diag_cm(chunk: str) -> bool:
-            for a,b,c,d,_,_ in cm_re.findall(chunk):
-                try:
-                    a,b,c,d = float(a), float(b), float(c), float(d)
-                    # angle of x-axis
-                    ang = abs(math.degrees(math.atan2(b, a)))
-                    if angle_min <= ang <= angle_max:
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        for pno in range(len(doc)):
+        for pno in range(sample_n):
             page = doc.load_page(pno)
-            xrefs = page.get_contents()
-            if not xrefs:
-                continue
-
+            page_hashes = set()
             try:
                 raw = page.read_contents().decode("latin-1", errors="ignore")
             except Exception:
-                continue
+                per_page_xobj_hashes.append(page_hashes); continue
 
-            parts = qQ_split.split(raw)
-            if len(parts) <= 1:
-                continue
-
-            page_area = max(1.0, page.rect.get_area())
-            drs, union_rect = drawings_cache[pno]
-            area_large_flag = False
-            if union_rect:
-                union_area_frac = union_rect.get_area() / page_area
-                if union_area_frac >= area_frac_min and len(drs) >= 30:
-                    # many drawing items and large area: typical outline watermark
-                    area_large_flag = True
-
-            changed = False
-            out = []
-            total_len = len(raw)
-
-            # We’ll track offset while re-assembling to estimate tail-ness based on index
-            # Compute cumulative lengths to find the original position of each chunk.
-            # Simpler heuristic: use running length from beginning while rebuilding.
-            running = 0
-            i = 0
-            while i < len(parts):
-                chunk = parts[i]
-                if i % 2 == 1:
-                    # this is a q..Q block (graphics state chunk)
-                    vector_ops = len(path_ops_re.findall(chunk))
-                    text_ops   = len(text_ops_re.findall(chunk))
-                    xobj_ops   = len(xobj_do_re.findall(chunk))
-                    score = vector_ops - text_ops - xobj_ops
-
-                    # position of this chunk as fraction in original stream (approx with running+len(chunk)/total)
-                    pos_frac = (running + len(chunk)/2.0) / float(total_len) if total_len > 0 else 0.0
-                    near_tail = pos_frac >= stream_tail_fraction
-
-                    has_diag = _has_diag_cm(chunk)
-
-                    if vector_ops >= min_vector_ops and ( (has_diag and near_tail) or area_large_flag ) and score >= min_vector_score:
-                        # Drop this vector overlay block
-                        removed += 1
-                        changed = True
-                        running += len(chunk)
-                        i += 1
-                        continue
-
-                out.append(chunk)
-                running += len(chunk)
-                i += 1
-
-            if changed:
-                new_raw = "".join(out).encode("latin-1", errors="ignore")
-                try:
-                    if isinstance(xrefs, (list, tuple)) and xrefs:
-                        page.parent.update_stream(xrefs[0], new_raw)
-                        for xr in xrefs[1:]:
-                            page.parent.update_stream(xr, b"")
+            # Robust mapping from XObject name -> xref (dict or tuple forms)
+            name_to_xref = {}
+            try:
+                xobjs = page.get_xobjects()
+                for it in xobjs:
+                    if isinstance(it, dict):
+                        nm = it.get("name")
+                        xr = it.get("xref")
+                        if nm is None or xr is None: 
+                            continue
+                        if isinstance(nm, bytes):
+                            nm = nm.decode("latin-1", "ignore")
+                        nm = str(nm).lstrip("/")
+                        name_to_xref[nm] = xr
                     else:
-                        page.parent.update_stream(xrefs, new_raw)
+                        # tuple fallback: try to find a name like "/Im1" and an int xref
+                        nm = None; xr = None
+                        for v in it:
+                            if isinstance(v, int) and xr is None:
+                                xr = v
+                            if isinstance(v, (bytes, str)):
+                                s = v.decode("latin-1", "ignore") if isinstance(v, bytes) else v
+                                if s.startswith("/") and nm is None:
+                                    nm = s
+                        if nm and xr:
+                            name_to_xref[nm.lstrip("/")] = xr
+            except Exception:
+                pass
+
+            used_names = set(xobj_do_full.findall(raw))
+            for nm in used_names:
+                xr = name_to_xref.get(nm)
+                if not xr:
+                    continue
+                # Heuristic: only consider vector-like XObjects: no text ops, some path ops
+                try:
+                    s = (doc.xref_stream(xr) or b"").decode("latin-1", "ignore")
                 except Exception:
-                    pass
+                    s = ""
+                if not s:
+                    continue  # likely image or binary; skip for "vector" pass
+                if text_ops_re.search(s):
+                    continue
+                if len(path_ops_re.findall(s)) < min_vector_ops_sample:
+                    continue
 
-        return removed
+                h = _xobject_stream_hash(doc, xr)
+                page_hashes.add((xr, h))
+            per_page_xobj_hashes.append(page_hashes)
 
-    # ---------- Original passes ----------
-    @staticmethod
-    def _remove_confidential_watermarks(doc):
+        # Count repeated hashes across sampled pages
+        hash_count = {}
+        xref_by_hash = {}
+        for ph in per_page_xobj_hashes:
+            for xr, h in ph:
+                hash_count[h] = hash_count.get(h, 0) + 1
+                xref_by_hash.setdefault(h, xr)
+
+        repeated_hashes = {h for h, c in hash_count.items() if c >= hit_min}
+
         removed = 0
-        phrases = [
-            "CONFIDENTIAL INFORMATION - DO NOT DISTRIBUTE",
-            "CONFIDENTIAL INFORMATION",
-            "DO NOT DISTRIBUTE",
-            "CONFIDENTIAL",
-            "DRAFT",
-            "INTERNAL USE ONLY",
-        ]
-        up = [p.upper() for p in phrases]
-        for page in doc:
-            removed += WatermarkRemover._safe_delete_matching_annots(
-                page, lambda a: WatermarkRemover._annot_matches_watermark(a, up)
-            )
-        for page in doc:
-            removed += WatermarkRemover._strip_text_objects(page, phrases)
+
+        # Blank repeated XObject streams once (affects all placements)
+        for h in repeated_hashes:
+            xr = xref_by_hash.get(h)
+            if not xr:
+                continue
+            try:
+                doc.update_stream(xr, b"")
+                removed += 1
+            except Exception:
+                pass
+
+        # ---------- Stage B: fallback q..Q repeated-chunk remover (majority threshold) ----------
+        per_page_sigs = []
+        for pno in range(sample_n):
+            try:
+                page = doc.load_page(pno)
+                raw = page.read_contents().decode("latin-1", errors="ignore")
+                parts = qQ_split.split(raw)
+            except Exception:
+                per_page_sigs.append(set()); continue
+
+            page_s = set()
+            for i, chunk in enumerate(parts):
+                if i % 2 == 1:  # q..Q block
+                    vector_ops = len(path_ops_re.findall(chunk))
+                    if vector_ops < min_vector_ops_sample:
+                        continue
+                    if text_ops_re.search(chunk):
+                        continue
+                    page_s.add(_sig(chunk))
+            per_page_sigs.append(page_s)
+
+        if per_page_sigs:
+            sig_count = {}
+            for s in per_page_sigs:
+                for sig in s:
+                    sig_count[sig] = sig_count.get(sig, 0) + 1
+            repeated_sigs = {s for s, c in sig_count.items() if c >= hit_min}
+        else:
+            repeated_sigs = set()
+
+        # Remove those signatures across all pages
+        if repeated_sigs:
+            for pno in range(len(doc)):
+                page = doc.load_page(pno)
+                xrefs = page.get_contents()
+                if not xrefs:
+                    continue
+                try:
+                    raw = page.read_contents().decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
+                parts = qQ_split.split(raw)
+                changed = False
+                out = []
+                for i, chunk in enumerate(parts):
+                    if i % 2 == 1:
+                        sig = _sig(chunk)
+                        if sig in repeated_sigs:
+                            if min_vector_ops_remove > 0:
+                                vops = len(path_ops_re.findall(chunk))
+                                if vops < min_vector_ops_remove:
+                                    out.append(chunk); continue
+                            removed += 1
+                            changed = True
+                            continue
+                    out.append(chunk)
+                if changed:
+                    new_raw = "".join(out).encode("latin-1", errors="ignore")
+                    try:
+                        if isinstance(xrefs, (list, tuple)) and xrefs:
+                            page.parent.update_stream(xrefs[0], new_raw)
+                            for xr in xrefs[1:]:
+                                page.parent.update_stream(xr, b"")
+                        else:
+                            page.parent.update_stream(xrefs, new_raw)
+                    except Exception:
+                        pass
+
         return removed
 
+    # ---------- Text / generic passes ----------
     @staticmethod
     def _remove_generic_watermarks(doc):
-        if len(doc) < 2: return 0
+        if len(doc) < 2:
+            return 0
         removed = 0
         cands = WatermarkRemover._detect_repeating_text_patterns(doc)
         for page in doc:
@@ -478,12 +511,10 @@ class PDFProcessorThread(QThread):
     preview_ready = pyqtSignal(str, str)
 
     def __init__(self, pdf_files,
-                 remove_confidential=True,
                  remove_generic=True,
-                 handle_vector=False):
+                 handle_vector=True):
         super().__init__()
         self.pdf_files = pdf_files
-        self.remove_confidential = remove_confidential
         self.remove_generic = remove_generic
         self.handle_vector = handle_vector
         self.cancel_requested = False
@@ -503,7 +534,6 @@ class PDFProcessorThread(QThread):
 
                 WatermarkRemover.remove_watermarks(
                     str(input_path), str(output_path),
-                    remove_confidential=self.remove_confidential,
                     remove_generic=self.remove_generic,
                     handle_vector=self.handle_vector,
                     status_cb=_status
@@ -530,12 +560,10 @@ class PreviewGeneratorThread(QThread):
     status_updated = pyqtSignal(str)
 
     def __init__(self, pdf_file,
-                 remove_confidential=True,
                  remove_generic=True,
-                 handle_vector=False):
+                 handle_vector=True):
         super().__init__()
         self.pdf_file = pdf_file
-        self.remove_confidential = remove_confidential
         self.remove_generic = remove_generic
         self.handle_vector = handle_vector
         self.cancel_requested = False
@@ -550,7 +578,6 @@ class PreviewGeneratorThread(QThread):
 
             WatermarkRemover.remove_watermarks(
                 self.pdf_file, self.tmp_output,
-                remove_confidential=self.remove_confidential,
                 remove_generic=self.remove_generic,
                 handle_vector=self.handle_vector,
                 status_cb=_status
@@ -612,6 +639,9 @@ class PDFPreviewWidget(QScrollArea):
         self.current_pdfs = (None, None)
         self.original_label.setPixmap(QPixmap()); self.original_label.setText(reason_text)
         self.processed_label.setPixmap(QPixmap()); self.processed_label.setText(reason_text)
+
+    def clear_preview(self, text="Refreshing preview…"):
+        self.set_preview_disabled(text)
 
     def update_preview(self, original_path, processed_path):
         self.current_pdfs = (original_path, processed_path)
@@ -747,11 +777,10 @@ class WatermarkRemovalApp(QMainWindow):
         settings_group = QGroupBox("Watermark Removal Settings")
         settings_layout = QHBoxLayout(settings_group)
 
-        self.confidential_checkbox = QCheckBox("Remove 'CONFIDENTIAL' watermarks"); self.confidential_checkbox.setChecked(True)
-        self.generic_checkbox = QCheckBox("Auto-detect and remove repeating watermarks"); self.generic_checkbox.setChecked(True)
+        # Removed the CONFIDENTIAL checkbox / features.
+        self.generic_checkbox = QCheckBox("Auto-detect and remove repeating text watermarks"); self.generic_checkbox.setChecked(True)
         self.vector_checkbox = QCheckBox("Handle vector/object-based watermarks (path overlays)"); self.vector_checkbox.setChecked(True)
 
-        settings_layout.addWidget(self.confidential_checkbox)
         settings_layout.addWidget(self.generic_checkbox)
         settings_layout.addWidget(self.vector_checkbox)
 
@@ -810,6 +839,20 @@ class WatermarkRemovalApp(QMainWindow):
 
         self.current_files = []
 
+        # --- PREVIEW: clear first, then refresh whenever a checkbox changes ---
+        self.generic_checkbox.toggled.connect(self.on_settings_changed)
+        self.vector_checkbox.toggled.connect(self.on_settings_changed)
+
+    def on_settings_changed(self, _=None):
+        """Clear preview immediately, then regenerate (if exactly one file is selected)."""
+        self.preview_widget.clear_preview("Refreshing preview…")
+        if self.preview_thread and self.preview_thread.isRunning():
+            self.preview_thread.cancel()
+        if len(self.current_files) == 1:
+            self._start_preview(self.current_files[0])
+        else:
+            self.preview_widget.set_preview_disabled("Preview disabled when multiple PDFs are selected.")
+
     def handle_files_dropped(self, files):
         if self.preview_thread and self.preview_thread.isRunning():
             self.preview_thread.cancel()
@@ -836,13 +879,11 @@ class WatermarkRemovalApp(QMainWindow):
             self.preview_widget.set_preview_disabled("Preview disabled when multiple PDFs are selected.")
 
     def _start_preview(self, pdf_file):
-        remove_confidential = self.confidential_checkbox.isChecked()
         remove_generic = self.generic_checkbox.isChecked()
         handle_vector = self.vector_checkbox.isChecked()
 
         self.preview_thread = PreviewGeneratorThread(
             pdf_file,
-            remove_confidential=remove_confidential,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
         )
@@ -864,13 +905,11 @@ class WatermarkRemovalApp(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        remove_confidential = self.confidential_checkbox.isChecked()
         remove_generic = self.generic_checkbox.isChecked()
         handle_vector = self.vector_checkbox.isChecked()
 
         self.processor_thread = PDFProcessorThread(
             self.current_files,
-            remove_confidential=remove_confidential,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
         )
