@@ -1,6 +1,10 @@
-# Professional PDF Watermark Removal Application
+# Professional PDF Watermark Removal Application - Simplified Version
 # (Non-destructive + Safe Annot Deletion + Smart Preview + Open-All-When-Done)
-# Vector/object watermarks: samples first 5 pages for identical overlays (XObject hashing + q..Q majority) & deletes those across all pages.
+# Vector/object watermarks: samples first N pages for identical overlays (XObject hashing + q..Q majority)
+# Geometry-aware fallback for "flattened" PDFs:
+#   - Repeated large-diagonal TEXT regions by geometry (rawdict)
+#   - Repeated large-area VECTOR overlays by drawings()
+#   - Visual repeat-mask (low-res) as last resort → targeted redaction rectangles only
 
 import sys
 import os
@@ -11,6 +15,8 @@ import platform
 import hashlib
 from pathlib import Path
 import tempfile
+from collections import defaultdict, Counter
+from copy import deepcopy
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -39,6 +45,41 @@ def open_file_cross_platform(path: str):
         pass
 
 
+# ---------------------- UTIL ----------------------
+
+def _rect_center_norm(rect: fitz.Rect, page_rect: fitz.Rect):
+    cx = (rect.x0 + rect.x1) / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0
+    return ( (cx - page_rect.x0) / page_rect.width, (cy - page_rect.y0) / page_rect.height )
+
+def _rect_area_frac(rect: fitz.Rect, page_rect: fitz.Rect):
+    return max(0.0, min(1.0, rect.get_area() / max(1.0, page_rect.get_area())))
+
+def _merge_close_rects(rects, max_gap=6):
+    if not rects: return []
+    rects = [fitz.Rect(r) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        used = [False]*len(rects)
+        for i in range(len(rects)):
+            if used[i]: continue
+            r = rects[i]
+            for j in range(i+1, len(rects)):
+                if used[j]: continue
+                s = rects[j]
+                rr = fitz.Rect(r.x0-max_gap, r.y0-max_gap, r.x1+max_gap, r.y1+max_gap)
+                if rr.intersects(s):
+                    r = r | s
+                    used[j] = True
+                    changed = True
+            used[i] = True
+            out.append(r)
+        rects = out
+    return rects
+
+
 class WatermarkRemover:
     """Static helper for watermark removal—used by both preview and processing threads."""
 
@@ -46,27 +87,73 @@ class WatermarkRemover:
     def remove_watermarks(input_path, output_path,
                           remove_generic=True,
                           handle_vector=True,
+                          cfg=None,
                           status_cb=None):
+        """
+        Main pipeline:
+          1) Vector/object repeated overlays (XObject hashing + q..Q signatures)
+          2) Generic text passes (repeating phrases + diagonal big text)
+          3) Artifact-tagged watermarks
+          4) Fallback (ONLY IF needed): geometry-based text/vector removal, then visual repeat-mask redaction as last resort
+        """
         try:
+            if cfg is None: cfg = {}
             doc = fitz.open(input_path)
             if doc.is_encrypted:
                 raise RuntimeError("PDF is password-protected")
 
             total_removed = 0
 
-            # Vector/object watermark handler (repeated overlays across pages)
+            # 1) Vector/object watermark handler (repeated overlays across pages)
             if handle_vector:
                 if status_cb: status_cb("Scanning for repeated vector/object watermarks…")
-                total_removed += WatermarkRemover._remove_vector_object_watermarks(doc)
+                total_removed += WatermarkRemover._remove_vector_object_watermarks(
+                    doc,
+                    sample_pages=cfg.get("sample_pages", 5),
+                    min_vector_ops_sample=cfg.get("min_vector_ops_sample", 5),
+                    min_vector_ops_remove=cfg.get("min_vector_ops_remove", 5),
+                    repeat_threshold=cfg.get("repeat_threshold", 0.8),
+                )
 
-            # Generic repeating + diagonal big text
+            # 2) Generic repeating + diagonal big text
             if remove_generic:
                 if status_cb: status_cb("Detecting & removing generic repeating text watermarks…")
-                total_removed += WatermarkRemover._remove_generic_watermarks(doc)
+                total_removed += WatermarkRemover._remove_generic_watermarks(
+                    doc,
+                    diag_min_deg=cfg.get("diag_min_deg", 10),
+                    diag_max_deg=cfg.get("diag_max_deg", 90),
+                    min_font_pt=cfg.get("min_font_pt", 9)
+                )
 
-            # Artifact-marked content
+            # 3) Artifact-marked content
             if status_cb: status_cb("Cleaning artifact-based watermark blocks…")
             total_removed += WatermarkRemover._remove_artifact_watermarks(doc)
+
+            # 4) Safer, geometry-first fallback (auto) if nothing changed
+            if total_removed == 0:
+                if status_cb: status_cb("No effect detected — attempting geometry-based fallback…")
+                removed_geom = WatermarkRemover._fallback_geometry_based(
+                    doc,
+                    sample_pages=cfg.get("sample_pages", 5),
+                    repeat_threshold=cfg.get("repeat_threshold", 0.8),
+                    diag_min_deg=cfg.get("diag_min_deg", 10),
+                    diag_max_deg=cfg.get("diag_max_deg", 90),
+                    min_font_pt=cfg.get("min_font_pt", 9),
+                    status_cb=status_cb
+                )
+                total_removed += removed_geom
+
+                # If still nothing and we strongly suspect a baked-in repeat, try a visual mask
+                if removed_geom == 0:
+                    if status_cb: status_cb("Trying last-resort: visual repeat mask (targeted redaction)…")
+                    total_removed += WatermarkRemover._fallback_visual_repeat_mask(
+                        doc,
+                        sample_pages=cfg.get("sample_pages", 5),
+                        grid=cfg.get("visual_grid", 64),
+                        gray_range_tol=cfg.get("visual_stability_tol", 5),
+                        max_total_area_frac=cfg.get("visual_max_area_frac", 0.05),
+                        status_cb=status_cb
+                    )
 
             doc.save(output_path, garbage=4, deflate=True, clean=True)
             doc.close()
@@ -81,16 +168,8 @@ class WatermarkRemover:
         sample_pages=5,
         min_vector_ops_sample=5,
         min_vector_ops_remove=5,
-        repeat_threshold=0.8,        # appear on ≥ 80% of sampled pages
+        repeat_threshold=0.8,
     ):
-        """
-        Two-stage remover:
-          A) XObject-based: hash form XObject streams used on the first N pages.
-             If the same XObject content appears on ≥ threshold of those pages,
-             blank that XObject's stream (removes all placements anywhere).
-          B) q..Q-block-based: repeated vector-heavy, no-text graphics-state blocks,
-             decided by majority threshold, then removed across the whole doc.
-        """
         if len(doc) == 0:
             return 0
 
@@ -129,22 +208,18 @@ class WatermarkRemover:
             except Exception:
                 per_page_xobj_hashes.append(page_hashes); continue
 
-            # Robust mapping from XObject name -> xref (dict or tuple forms)
+            # Robust mapping name -> xref
             name_to_xref = {}
             try:
                 xobjs = page.get_xobjects()
                 for it in xobjs:
                     if isinstance(it, dict):
-                        nm = it.get("name")
-                        xr = it.get("xref")
+                        nm = it.get("name"); xr = it.get("xref")
                         if nm is None or xr is None: 
                             continue
-                        if isinstance(nm, bytes):
-                            nm = nm.decode("latin-1", "ignore")
-                        nm = str(nm).lstrip("/")
-                        name_to_xref[nm] = xr
+                        if isinstance(nm, bytes): nm = nm.decode("latin-1", "ignore")
+                        name_to_xref[str(nm).lstrip("/")] = xr
                     else:
-                        # tuple fallback: try to find a name like "/Im1" and an int xref
                         nm = None; xr = None
                         for v in it:
                             if isinstance(v, int) and xr is None:
@@ -163,14 +238,13 @@ class WatermarkRemover:
                 xr = name_to_xref.get(nm)
                 if not xr:
                     continue
-                # Heuristic: only consider vector-like XObjects: no text ops, some path ops
                 try:
                     s = (doc.xref_stream(xr) or b"").decode("latin-1", "ignore")
                 except Exception:
                     s = ""
                 if not s:
-                    continue  # likely image or binary; skip for "vector" pass
-                if text_ops_re.search(s):
+                    continue
+                if text_ops_re.search(s):  # skip text forms; handled by text logic
                     continue
                 if len(path_ops_re.findall(s)) < min_vector_ops_sample:
                     continue
@@ -179,7 +253,6 @@ class WatermarkRemover:
                 page_hashes.add((xr, h))
             per_page_xobj_hashes.append(page_hashes)
 
-        # Count repeated hashes across sampled pages
         hash_count = {}
         xref_by_hash = {}
         for ph in per_page_xobj_hashes:
@@ -202,7 +275,7 @@ class WatermarkRemover:
             except Exception:
                 pass
 
-        # ---------- Stage B: fallback q..Q repeated-chunk remover (majority threshold) ----------
+        # ---------- Stage B: q..Q repeated-chunk remover (majority threshold) ----------
         per_page_sigs = []
         for pno in range(sample_n):
             try:
@@ -232,7 +305,6 @@ class WatermarkRemover:
         else:
             repeated_sigs = set()
 
-        # Remove those signatures across all pages
         if repeated_sigs:
             for pno in range(len(doc)):
                 page = doc.load_page(pno)
@@ -274,7 +346,7 @@ class WatermarkRemover:
 
     # ---------- Text / generic passes ----------
     @staticmethod
-    def _remove_generic_watermarks(doc):
+    def _remove_generic_watermarks(doc, diag_min_deg=10, diag_max_deg=90, min_font_pt=10):
         if len(doc) < 2:
             return 0
         removed = 0
@@ -286,7 +358,9 @@ class WatermarkRemover:
         for page in doc:
             if cands:
                 removed += WatermarkRemover._strip_text_objects(page, phrases=cands)
-            removed += WatermarkRemover._strip_diagonal_large_text(page, min_pt=24, min_deg=30, max_deg=60)
+            removed += WatermarkRemover._strip_diagonal_large_text(
+                page, min_pt=min_font_pt, min_deg=diag_min_deg, max_deg=diag_max_deg
+            )
         return removed
 
     @staticmethod
@@ -374,7 +448,7 @@ class WatermarkRemover:
             return 0
 
     @staticmethod
-    def _strip_diagonal_large_text(page, min_pt=24, min_deg=30, max_deg=60):
+    def _strip_diagonal_large_text(page, min_pt=10, min_deg=10, max_deg=90):
         removed = 0
         try:
             text = page.get_text("dict")
@@ -501,6 +575,335 @@ class WatermarkRemover:
                     pass
         return removed_count
 
+    # ---------- Fallback: Geometry-first (auto) ----------
+    @staticmethod
+    def _fallback_geometry_based(doc, sample_pages=5, repeat_threshold=0.8,
+                                 diag_min_deg=10, diag_max_deg=90, min_font_pt=10,
+                                 status_cb=None):
+        if len(doc) == 0:
+            return 0
+
+        removed = 0
+        pages_to_sample = min(sample_pages, len(doc))
+
+        # --- TEXT GEOMETRY (large + diagonal + central-ish) ---
+        diag_boxes_by_page = []
+        for pno in range(pages_to_sample):
+            page = doc.load_page(pno)
+            page_rect = page.rect
+            raw = page.get_text("rawdict")
+            candidates = []
+            for b in raw.get("blocks", []):
+                if b.get("type") != 0:  # text only
+                    continue
+                for l in b.get("lines", []):
+                    d = l.get("dir")
+                    if not d:
+                        continue
+                    angle = abs(math.degrees(math.atan2(d[1], d[0])))
+                    if not (diag_min_deg <= angle <= diag_max_deg):
+                        continue
+                    size_max = 0
+                    r = None
+                    for s in l.get("spans", []):
+                        size_max = max(size_max, float(s.get("size", 0)))
+                        sb = s.get("bbox")
+                        if sb:
+                            r = fitz.Rect(sb) if r is None else (fitz.Rect(sb) | r)
+                    if size_max >= min_font_pt and r is not None:
+                        cx, cy = _rect_center_norm(r, page_rect)
+                        if 0.15 <= cx <= 0.85 and 0.15 <= cy <= 0.85:
+                            candidates.append(r)
+            diag_boxes_by_page.append(_merge_close_rects(candidates))
+
+        bin_hits = Counter()
+        for pno in range(pages_to_sample):
+            page = doc.load_page(pno)
+            pr = page.rect
+            for r in diag_boxes_by_page[pno]:
+                cx, cy = _rect_center_norm(r, pr)
+                bx = int(round(cx * 10)); by = int(round(cy * 10))
+                bin_hits[(bx, by)] += 1
+
+        hit_min = max(1, int(round(pages_to_sample * repeat_threshold)))
+        repeated_bins = {k for k, c in bin_hits.items() if c >= hit_min}
+
+        if repeated_bins:
+            if status_cb: status_cb("Fallback: removing repeated diagonal text by geometry…")
+            tm_rot = re.compile(r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm", re.I)
+            tf_big = re.compile(r"/[A-Za-z0-9]+\s+(\d{2,})\s+Tf", re.I)
+            bt_et_split_re = re.compile(r"(BT.*?ET)", re.S | re.I)
+
+            for pno in range(len(doc)):
+                page = doc.load_page(pno)
+                pr = page.rect
+                xrefs = page.get_contents()
+                if not xrefs:
+                    continue
+                try:
+                    raw = page.read_contents().decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
+                parts = bt_et_split_re.split(raw)
+                changed = False
+                out = []
+                for i, chunk in enumerate(parts):
+                    remove_this = False
+                    if i % 2 == 1:
+                        has_big = any(float(s) >= min_font_pt for s in tf_big.findall(chunk))
+                        if has_big:
+                            block_rect = None
+                            for a,b,c,d,e,f in tm_rot.findall(chunk):
+                                try:
+                                    a,b,c,d,e,f = map(float, (a,b,c,d,e,f))
+                                    x0 = e - 20; y0 = f - 20; x1 = e + 20; y1 = f + 20
+                                    block_rect = fitz.Rect(x0,y0,x1,y1)
+                                    break
+                                except Exception:
+                                    pass
+                            if block_rect:
+                                cx, cy = _rect_center_norm(block_rect, pr)
+                                bx = int(round(cx * 10)); by = int(round(cy * 10))
+                                if (bx,by) in repeated_bins:
+                                    rot_hit = False
+                                    for a,b,_,_,_,_ in tm_rot.findall(chunk):
+                                        try:
+                                            a,b = float(a), float(b)
+                                            ang = abs(math.degrees(math.atan2(b, a)))
+                                            if diag_min_deg <= ang <= diag_max_deg:
+                                                rot_hit = True; break
+                                        except:
+                                            pass
+                                    if rot_hit:
+                                        remove_this = True
+                    if remove_this:
+                        removed += 1
+                        changed = True
+                    else:
+                        out.append(chunk)
+
+                bt_blocks = max(1, len(parts)//2)
+                hits = (len(parts)//2) - (len(out)//2)
+                if changed and (hits / bt_blocks) <= 0.3:
+                    new_raw = "".join(out).encode("latin-1", errors="ignore")
+                    try:
+                        if isinstance(xrefs, (list, tuple)) and xrefs:
+                            page.parent.update_stream(xrefs[0], new_raw)
+                            for xr in xrefs[1:]:
+                                page.parent.update_stream(xr, b"")
+                        else:
+                            page.parent.update_stream(xrefs, new_raw)
+                    except Exception:
+                        pass
+
+        # --- VECTOR GEOMETRY (large-area outlines) ---
+        area_bins = Counter()
+        for pno in range(pages_to_sample):
+            page = doc.load_page(pno)
+            pr = page.rect
+            drs = []
+            try:
+                drs = page.get_drawings()
+            except Exception:
+                pass
+            union = None
+            for d in drs:
+                r = d.get("rect")
+                if not r:
+                    continue
+                rr = fitz.Rect(r)
+                union = rr if union is None else (union | rr)
+            if union and _rect_area_frac(union, pr) >= 0.05:
+                cx, cy = _rect_center_norm(union, pr)
+                bx = int(round(cx * 10)); by = int(round(cy * 10))
+                area_bins[(bx,by)] += 1
+
+        repeated_area_bins = {k for k,c in area_bins.items() if c >= hit_min}
+
+        if repeated_area_bins:
+            qQ_split = re.compile(r"(q.*?Q)", re.S)
+            path_ops_re = re.compile(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\*?|B\*?|b\*?|W\*?|W|n|cm)(?![A-Za-z])")
+            cm_re = re.compile(r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+cm")
+            for pno in range(len(doc)):
+                page = doc.load_page(pno)
+                pr = page.rect
+                xrefs = page.get_contents()
+                if not xrefs:
+                    continue
+                try:
+                    raw = page.read_contents().decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
+                parts = qQ_split.split(raw)
+                changed = False
+                out = []
+                for i, chunk in enumerate(parts):
+                    remove_this = False
+                    if i % 2 == 1:
+                        vops = len(path_ops_re.findall(chunk))
+                        if vops >= 5:
+                            block_rect = None
+                            for a,b,c,d,e,f in cm_re.findall(chunk):
+                                try:
+                                    a,b,c,d,e,f = map(float, (a,b,c,d,e,f))
+                                    x0 = e - 40; y0 = f - 40; x1 = e + 40; y1 = f + 40
+                                    block_rect = fitz.Rect(x0,y0,x1,y1)
+                                except:
+                                    pass
+                            if block_rect:
+                                cx, cy = _rect_center_norm(block_rect, pr)
+                                bx = int(round(cx*10)); by = int(round(cy*10))
+                                if (bx,by) in repeated_area_bins:
+                                    has_diag = False
+                                    for a,b,_,_,_,_ in cm_re.findall(chunk):
+                                        try:
+                                            a,b = float(a), float(b)
+                                            ang = abs(math.degrees(math.atan2(b, a)))
+                                            if 20 <= ang <= 80:
+                                                has_diag = True; break
+                                        except:
+                                            pass
+                                    if has_diag:
+                                        remove_this = True
+                    if remove_this:
+                        removed += 1
+                        changed = True
+                    else:
+                        out.append(chunk)
+
+                qblocks = max(1, len(parts)//2)
+                hits = (len(parts)//2) - (len(out)//2)
+                if changed and (hits / qblocks) <= 0.3:
+                    new_raw = "".join(out).encode("latin-1", errors="ignore")
+                    try:
+                        if isinstance(xrefs, (list, tuple)) and xrefs:
+                            page.parent.update_stream(xrefs[0], new_raw)
+                            for xr in xrefs[1:]:
+                                page.parent.update_stream(xr, b"")
+                        else:
+                            page.parent.update_stream(xrefs, new_raw)
+                    except Exception:
+                        pass
+
+        if status_cb:
+            status_cb(f"Geometry fallback removed {removed} blocks.")
+        return removed
+
+    # ---------- Fallback: Visual repeat mask (last resort; auto) ----------
+    @staticmethod
+    def _fallback_visual_repeat_mask(doc, sample_pages=5, grid=64, gray_range_tol=3,
+                                     max_total_area_frac=0.05, status_cb=None):
+        if len(doc) == 0:
+            return 0
+
+        pages_to_sample = min(sample_pages, len(doc))
+        rasters = []
+        widths = []
+        heights = []
+        zoom = 0.75  # low DPI scale
+
+        for pno in range(pages_to_sample):
+            try:
+                page = doc.load_page(pno)
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
+                widths.append(pix.width); heights.append(pix.height)
+                rasters.append(pix)
+            except Exception:
+                pass
+
+        if not rasters:
+            return 0
+
+        W = min(widths); H = min(heights)
+        tw = max(1, W // grid)
+        th = max(1, H // grid)
+
+        tile_vals = defaultdict(list)
+        for pix in rasters:
+            if pix.width != W or pix.height != H:
+                tmp = fitz.Pixmap(fitz.csGRAY, W, H)
+                tmp.clear_with(255)
+                tmp.copy(pix, 0, 0)
+                pix = tmp
+            buf = pix.samples
+            for j in range(grid):
+                for i in range(grid):
+                    x0 = i*tw; y0 = j*th
+                    x1 = min(W, x0+tw); y1 = min(H, y0+th)
+                    if x1<=x0 or y1<=y0: 
+                        continue
+                    s = 0; n = 0
+                    for yy in range(y0, y1):
+                        row = yy*pix.stride
+                        s += sum(buf[row+x0: row+x1])
+                        n += (x1-x0)
+                    avg = s / max(1, n)
+                    tile_vals[(i,j)].append(avg)
+
+        stable_tiles = set()
+        need_hits = max(2, int(round(pages_to_sample * 0.90)))
+        for key, vals in tile_vals.items():
+            if len(vals) < need_hits:
+                continue
+            rng = max(vals) - min(vals)
+            if rng <= gray_range_tol:  # configurable stability tolerance
+                stable_tiles.add(key)
+
+        if not stable_tiles:
+            return 0
+
+        page0 = doc.load_page(0)
+        pr = page0.rect
+        scale_x = pr.width / W
+        scale_y = pr.height / H
+
+        rects = []
+        for j in range(grid):
+            i = 0
+            while i < grid:
+                if (i,j) in stable_tiles:
+                    start_i = i
+                    while i < grid and (i,j) in stable_tiles:
+                        i += 1
+                    end_i = i-1
+                    x0 = start_i*tw*scale_x + pr.x0
+                    x1 = min(W, (end_i+1)*tw)*scale_x + pr.x0
+                    y0 = j*th*scale_y + pr.y0
+                    y1 = min(H, (j+1)*th)*scale_y + pr.y0
+                    rects.append(fitz.Rect(x0,y0,x1,y1))
+                i += 1
+
+        rects = _merge_close_rects(rects, max_gap=8)
+        rects = [r for r in rects if 0.001 <= _rect_area_frac(r, pr) <= 0.12]
+
+        if not rects:
+            return 0
+
+        total_area_frac = sum(_rect_area_frac(r, pr) for r in rects)
+        if total_area_frac > max_total_area_frac:
+            return 0
+
+        removed = 0
+        for pno in range(len(doc)):
+            page = doc.load_page(pno)
+            for r in rects:
+                try:
+                    page.add_redact_annot(r, fill=(1,1,1))
+                except Exception:
+                    pass
+            try:
+                page.apply_redactions()
+                removed += 1
+            except Exception:
+                pass
+
+        if status_cb:
+            status_cb(f"Visual fallback applied on {removed} pages.")
+        return removed
+
+
+# ---------------------- THREADS ----------------------
 
 class PDFProcessorThread(QThread):
     progress_updated = pyqtSignal(int)
@@ -512,11 +915,13 @@ class PDFProcessorThread(QThread):
 
     def __init__(self, pdf_files,
                  remove_generic=True,
-                 handle_vector=True):
+                 handle_vector=True,
+                 cfg=None):
         super().__init__()
         self.pdf_files = pdf_files
         self.remove_generic = remove_generic
         self.handle_vector = handle_vector
+        self.cfg = deepcopy(cfg) if cfg else {}
         self.cancel_requested = False
         self.processed_files = []
 
@@ -536,6 +941,7 @@ class PDFProcessorThread(QThread):
                     str(input_path), str(output_path),
                     remove_generic=self.remove_generic,
                     handle_vector=self.handle_vector,
+                    cfg=self.cfg,
                     status_cb=_status
                 )
 
@@ -561,11 +967,13 @@ class PreviewGeneratorThread(QThread):
 
     def __init__(self, pdf_file,
                  remove_generic=True,
-                 handle_vector=True):
+                 handle_vector=True,
+                 cfg=None):
         super().__init__()
         self.pdf_file = pdf_file
         self.remove_generic = remove_generic
         self.handle_vector = handle_vector
+        self.cfg = deepcopy(cfg) if cfg else {}
         self.cancel_requested = False
         self.tmp_output = None
 
@@ -580,6 +988,7 @@ class PreviewGeneratorThread(QThread):
                 self.pdf_file, self.tmp_output,
                 remove_generic=self.remove_generic,
                 handle_vector=self.handle_vector,
+                cfg=self.cfg,
                 status_cb=_status
             )
             if not self.cancel_requested:
@@ -591,6 +1000,8 @@ class PreviewGeneratorThread(QThread):
     def cancel(self):
         self.cancel_requested = True
 
+
+# ---------------------- UI WIDGETS ----------------------
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal()
@@ -749,20 +1160,38 @@ class DropZoneWidget(QLabel):
             self.files_dropped.emit(files)
 
 
+# ---------------------- MAIN APP ----------------------
+
 class WatermarkRemovalApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.processor_thread = None
         self.preview_thread = None
         self.processed_files = []
+        self.cfg = self._default_cfg()
 
         self.init_ui()
         self.setWindowTitle("PDF Watermark Remover by Emil Ferdman (With Help from ChatGPT)")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1200, 700)
         try:
             self.setWindowIcon(QIcon("icon.png"))
         except:
             pass
+
+    # ---- configuration ----
+    def _default_cfg(self):
+        return {
+            "sample_pages": 5,
+            "repeat_threshold": 0.8,
+            "min_vector_ops_sample": 5,
+            "min_vector_ops_remove": 5,
+            "diag_min_deg": 10,
+            "diag_max_deg": 90,
+            "min_font_pt": 9,
+            "visual_grid": 64,
+            "visual_stability_tol": 3,
+            "visual_max_area_frac": 0.05,
+        }
 
     def init_ui(self):
         central_widget = QWidget(); self.setCentralWidget(central_widget)
@@ -774,15 +1203,16 @@ class WatermarkRemovalApp(QMainWindow):
         title_label.setFont(title_font); title_label.setStyleSheet("color: #2c3e50; margin-bottom: 10px;")
         layout.addWidget(title_label)
 
+        # --- Settings row ---
         settings_group = QGroupBox("Watermark Removal Settings")
         settings_layout = QHBoxLayout(settings_group)
 
-        # Removed the CONFIDENTIAL checkbox / features.
         self.generic_checkbox = QCheckBox("Auto-detect and remove repeating text watermarks"); self.generic_checkbox.setChecked(True)
-        self.vector_checkbox = QCheckBox("Handle vector/object-based watermarks (path overlays)"); self.vector_checkbox.setChecked(True)
+        self.vector_checkbox  = QCheckBox("Handle vector/object-based watermarks (path overlays)"); self.vector_checkbox.setChecked(True)
 
         settings_layout.addWidget(self.generic_checkbox)
         settings_layout.addWidget(self.vector_checkbox)
+        settings_layout.addStretch()
 
         layout.addWidget(settings_group)
 
@@ -835,15 +1265,15 @@ class WatermarkRemovalApp(QMainWindow):
 
         self.preview_widget = PDFPreviewWidget(); right_layout.addWidget(self.preview_widget)
 
-        splitter.addWidget(right_panel); splitter.setSizes([600, 600])
+        splitter.addWidget(right_panel); splitter.setSizes([560, 640])
 
         self.current_files = []
 
-        # --- PREVIEW: clear first, then refresh whenever a checkbox changes ---
-        self.generic_checkbox.toggled.connect(self.on_settings_changed)
-        self.vector_checkbox.toggled.connect(self.on_settings_changed)
+        # --- PREVIEW: clear first, then refresh on any setting change ---
+        self.generic_checkbox.toggled.connect(self.on_any_setting_changed)
+        self.vector_checkbox.toggled.connect(self.on_any_setting_changed)
 
-    def on_settings_changed(self, _=None):
+    def on_any_setting_changed(self, _=None):
         """Clear preview immediately, then regenerate (if exactly one file is selected)."""
         self.preview_widget.clear_preview("Refreshing preview…")
         if self.preview_thread and self.preview_thread.isRunning():
@@ -886,6 +1316,7 @@ class WatermarkRemovalApp(QMainWindow):
             pdf_file,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
+            cfg=self.cfg
         )
         self.preview_thread.status_updated.connect(self.status_label.setText)
         self.preview_thread.error_occurred.connect(self.on_preview_error)
@@ -912,6 +1343,7 @@ class WatermarkRemovalApp(QMainWindow):
             self.current_files,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
+            cfg=self.cfg
         )
         self.processor_thread.progress_updated.connect(self.progress_bar.setValue)
         self.processor_thread.status_updated.connect(self.status_label.setText)
