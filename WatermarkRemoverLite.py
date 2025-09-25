@@ -10,6 +10,11 @@ PDF Watermark Remover — Lite (PyMuPDF-only)
   • two-pane preview (original vs processed) of page 1
   • checkboxes: generic text removal, vector/object removal
 - Processing & preview run on worker threads; UI remains responsive.
+
++ Added:
+  • "Non-XObject Nuke" button that outputs "(Only XObjects) <file>.pdf"
+  • "Nuke Preview" checkbox (off by default). When ON, preview shows the XObjects-only result.
+  • Nuke logic matches the provided 'strip_non_xobject_rendering' behavior: remove BT..ET, BI..EI, sh paints, and path paint ops, preserving only Do()
 """
 
 import os
@@ -33,7 +38,7 @@ from tkinter.scrolledtext import ScrolledText
 import base64
 
 APP_TITLE = "PDF Watermark Remover — Lite (PyMuPDF-only)"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def open_file_cross_platform(path: str):
@@ -95,6 +100,77 @@ def _merge_close_rects(rects, max_gap=6):
 
 class WatermarkRemover:
     """Static helper for watermark removal—used by both preview and processing workers."""
+
+    # ---------- NEW: Non-XObject Nuke helpers (keep only Do) ----------
+    BT_ET_RE   = re.compile(rb"\bBT\b.*?\bET\b", re.S)                # remove text blocks
+    INLINE_IMG = re.compile(rb"\bBI\b.*?\bEI\b", re.S)                # remove inline images
+    SHADE_RE   = re.compile(rb"/[^\s/]+\s+sh\b")                      # remove sh shading paints
+    PAINT_RE   = re.compile(rb"\b(S|s|f\*?|F|B\*?|b\*?|n)\b")         # remove path paint ops
+
+    @staticmethod
+    def _strip_non_xobject_rendering(stream_bytes: bytes) -> bytes:
+        """
+        Remove all rendering that is NOT via XObject 'Do':
+          - delete all text blocks (BT ... ET)
+          - delete inline images (BI ... EI)
+          - delete shading paints ('/Name sh')
+          - delete path painting operators (stroke/fill/clip-paint) so paths don't render
+        KEEP graphics state (q/Q/gs), transforms (cm), and XObject 'Do' calls.
+        """
+        s = stream_bytes
+        s = WatermarkRemover.BT_ET_RE.sub(b"", s)
+        s = WatermarkRemover.INLINE_IMG.sub(b"", s)
+        s = WatermarkRemover.SHADE_RE.sub(b"", s)
+        s = WatermarkRemover.PAINT_RE.sub(b"", s)
+        return s
+
+    @staticmethod
+    def nuke_non_xobjects(input_path: str, output_path: str, status_cb=None) -> int:
+        """
+        Create a copy of the PDF where only XObject draws (Do) remain by stripping
+        non-XObject rendering ops in-place. Matches the reference logic.
+        """
+        if status_cb:
+            status_cb("Non-XObject Nuke: opening document…")
+        doc = fitz.open(input_path)
+        if doc.is_encrypted:
+            raise RuntimeError("PDF is password-protected")
+
+        changed_pages = 0
+        for pno in range(len(doc)):
+            page = doc.load_page(pno)
+            xrefs = page.get_contents()
+            if not xrefs:
+                continue
+            if not isinstance(xrefs, (list, tuple)):
+                xrefs = [xrefs]
+            changed = False
+            for cx in xrefs:
+                try:
+                    data = doc.xref_stream(cx) or b""
+                except Exception:
+                    data = b""
+                if not data:
+                    continue
+                new_data = WatermarkRemover._strip_non_xobject_rendering(data)
+                if new_data != data:
+                    try:
+                        doc.update_stream(cx, new_data)
+                        changed = True
+                    except Exception:
+                        pass
+            if changed:
+                try:
+                    page.clean_contents()
+                except Exception:
+                    pass
+                changed_pages += 1
+
+        if status_cb:
+            status_cb(f"Non-XObject Nuke: updated {changed_pages} page(s).")
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+        return changed_pages
 
     @staticmethod
     def remove_watermarks(input_path, output_path,
@@ -866,7 +942,7 @@ class WatermarkRemover:
         heights = []
         zoom = 0.75  # low DPI scale
 
-        for pno in range(pages_to_sample):
+        for pno in range(sample_pages):
             try:
                 page = doc.load_page(pno)
                 mat = fitz.Matrix(zoom, zoom)
@@ -975,7 +1051,7 @@ class WatermarkRemover:
 # ---------------------- Worker threads ----------------------
 
 class ProcessorWorker(threading.Thread):
-    def __init__(self, files, remove_generic, handle_vector, cfg, ui_queue):
+    def __init__(self, files, remove_generic, handle_vector, cfg, ui_queue, mode='normal'):
         super().__init__(daemon=True)
         self.files = files
         self.remove_generic = remove_generic
@@ -984,6 +1060,7 @@ class ProcessorWorker(threading.Thread):
         self.ui_queue = ui_queue
         self._cancel = False
         self.processed = []
+        self.mode = mode  # 'normal' or 'nuke'
 
     def cancel(self):
         self._cancel = True
@@ -995,18 +1072,26 @@ class ProcessorWorker(threading.Thread):
                 break
             try:
                 base = Path(f)
-                out = base.parent / f"(No Watermarks) {base.name}"
+                if self.mode == 'normal':
+                    out = base.parent / f"(No Watermarks) {base.name}"
 
-                def _status(msg):
-                    self.ui_queue.put(("status", f"Processing {base.name}: {msg}"))
+                    def _status(msg):
+                        self.ui_queue.put(("status", f"Processing {base.name}: {msg}"))
 
-                WatermarkRemover.remove_watermarks(
-                    str(base), str(out),
-                    remove_generic=self.remove_generic,
-                    handle_vector=self.handle_vector,
-                    cfg=self.cfg,
-                    status_cb=_status
-                )
+                    WatermarkRemover.remove_watermarks(
+                        str(base), str(out),
+                        remove_generic=self.remove_generic,
+                        handle_vector=self.handle_vector,
+                        cfg=self.cfg,
+                        status_cb=_status
+                    )
+                else:
+                    out = base.parent / f"(Only XObjects) {base.name}"
+
+                    def _status(msg):
+                        self.ui_queue.put(("status", f"Non-XObject Nuke {base.name}: {msg}"))
+
+                    WatermarkRemover.nuke_non_xobjects(str(base), str(out), status_cb=_status)
 
                 self.processed.append((str(base), str(out)))
                 self.ui_queue.put(("log", f"✅ Processed: {base.name}\n    Output: {out.name}"))
@@ -1020,7 +1105,7 @@ class ProcessorWorker(threading.Thread):
 
 
 class PreviewWorker(threading.Thread):
-    def __init__(self, file_path, remove_generic, handle_vector, cfg, ui_queue):
+    def __init__(self, file_path, remove_generic, handle_vector, cfg, ui_queue, mode='normal'):
         super().__init__(daemon=True)
         self.file_path = file_path
         self.remove_generic = remove_generic
@@ -1029,6 +1114,7 @@ class PreviewWorker(threading.Thread):
         self.ui_queue = ui_queue
         self._cancel = False
         self.tmp_output = None
+        self.mode = mode  # 'normal' or 'nuke'
 
     def cancel(self):
         self._cancel = True
@@ -1036,18 +1122,29 @@ class PreviewWorker(threading.Thread):
     def run(self):
         try:
             base = os.path.basename(self.file_path)
-            self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {base}")
+            if self.mode == 'normal':
+                self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {base}")
 
-            def _status(msg):
-                self.ui_queue.put(("status", f"[Preview] {msg}"))
+                def _status(msg):
+                    self.ui_queue.put(("status", f"[Preview] {msg}"))
 
-            WatermarkRemover.remove_watermarks(
-                self.file_path, self.tmp_output,
-                remove_generic=self.remove_generic,
-                handle_vector=self.handle_vector,
-                cfg=self.cfg,
-                status_cb=_status
-            )
+                WatermarkRemover.remove_watermarks(
+                    self.file_path, self.tmp_output,
+                    remove_generic=self.remove_generic,
+                    handle_vector=self.handle_vector,
+                    cfg=self.cfg,
+                    status_cb=_status
+                )
+            else:
+                self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - Only XObjects) {base}")
+
+                def _status(msg):
+                    self.ui_queue.put(("status", f"[Preview] {msg}"))
+
+                WatermarkRemover.nuke_non_xobjects(
+                    self.file_path, self.tmp_output, status_cb=_status
+                )
+
             if not self._cancel:
                 self.ui_queue.put(("preview", (self.file_path, self.tmp_output)))
         except Exception as e:
@@ -1061,7 +1158,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1200x720")
+        self.geometry("1280x760")
         try:
             self.iconbitmap(default="")  # no external icon by default
         except Exception:
@@ -1101,10 +1198,13 @@ class App(tk.Tk):
         settings.pack(side="top", fill="x", padx=16, pady=8)
         self.var_generic = tk.BooleanVar(value=True)
         self.var_vector = tk.BooleanVar(value=True)
+        self.var_nuke_preview = tk.BooleanVar(value=False)
         chk1 = ttk.Checkbutton(settings, text="Auto-detect and remove repeating text watermarks", variable=self.var_generic, command=self._on_any_setting_changed)
         chk2 = ttk.Checkbutton(settings, text="Handle vector/object-based watermarks (path overlays)", variable=self.var_vector, command=self._on_any_setting_changed)
+        chk3 = ttk.Checkbutton(settings, text="Nuke Preview (show XObjects-only)", variable=self.var_nuke_preview, command=self._on_any_setting_changed)
         chk1.pack(side="left", padx=8, pady=8)
         chk2.pack(side="left", padx=8, pady=8)
+        chk3.pack(side="left", padx=8, pady=8)
 
         # Splitter (use paned window)
         paned = ttk.Panedwindow(self, orient="horizontal")
@@ -1129,8 +1229,10 @@ class App(tk.Tk):
         btns = ttk.Frame(prog_box)
         btns.pack(fill="x", padx=10, pady=(0, 10))
         self.btn_start = ttk.Button(btns, text="Start Processing", command=self.start_processing, state="disabled")
+        self.btn_nuke  = ttk.Button(btns, text="Non-XObject Nuke", command=self.start_nuke_processing, state="disabled")
         self.btn_cancel = ttk.Button(btns, text="Cancel", command=self.cancel_processing, state="disabled")
         self.btn_start.pack(side="left")
+        self.btn_nuke.pack(side="left", padx=8)
         self.btn_cancel.pack(side="left", padx=8)
 
         # Status + log
@@ -1148,19 +1250,15 @@ class App(tk.Tk):
         preview_box = ttk.Frame(right)
         preview_box.pack(fill="both", expand=True)
 
-        # Two preview panes (original / processed)
-        self.orig_label = ttk.Label(preview_box, text="Original page 1 preview will appear here", anchor="center")
-        self.proc_label = ttk.Label(preview_box, text="Processed (Preview) page 1 will appear here", anchor="center")
-
-        # Use tk.Label for images so we can set PhotoImage
+        # Use tk.Labels for images
         self.orig_img_label = tk.Label(preview_box, bg="#f9f9f9", relief="groove", width=64, height=24)
         self.proc_img_label = tk.Label(preview_box, bg="#f9f9f9", relief="groove", width=64, height=24)
 
         # Grid layout
         preview_box.columnconfigure(0, weight=1)
         preview_box.columnconfigure(1, weight=1)
-        self.orig_label.grid(row=0, column=0, sticky="w", padx=4, pady=(0, 4))
-        self.proc_label.grid(row=0, column=1, sticky="w", padx=4, pady=(0, 4))
+        ttk.Label(preview_box, text="Original page 1").grid(row=0, column=0, sticky="w", padx=4, pady=(0, 4))
+        ttk.Label(preview_box, text="Processed (Preview) page 1").grid(row=0, column=1, sticky="w", padx=4, pady=(0, 4))
         self.orig_img_label.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=4)
         self.proc_img_label.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=4)
 
@@ -1169,7 +1267,6 @@ class App(tk.Tk):
     def _on_any_setting_changed(self, *_):
         self._clear_preview("Refreshing preview…")
         if self.prev_worker and self.prev_worker.is_alive():
-            # No direct cancel for running PyMuPDF operation; we just ignore its result via a flag
             self.prev_worker.cancel()
         if len(self.files) == 1:
             self._start_preview(self.files[0])
@@ -1187,6 +1284,7 @@ class App(tk.Tk):
         count = len(files)
         self.file_label.config(text=f"{count} file(s) selected")
         self.btn_start.config(state="normal")
+        self.btn_nuke.config(state="normal")
         self.status.config(text=f"Ready to process {count} PDF file(s)")
 
         if count == 1:
@@ -1198,14 +1296,16 @@ class App(tk.Tk):
 
     # ---- Preview helpers ----
     def _start_preview(self, pdf_file):
+        mode = 'nuke' if self.var_nuke_preview.get() else 'normal'
         self.prev_worker = PreviewWorker(
             pdf_file,
             remove_generic=self.var_generic.get(),
             handle_vector=self.var_vector.get(),
             cfg=self.cfg,
-            ui_queue=self.ui_queue
+            ui_queue=self.ui_queue,
+            mode=mode
         )
-        self.log.insert("end", "🔍 Generating processed preview of the selected file…\n")
+        self.log.insert("end", ("🧨 Generating XObjects-only preview…" if mode == 'nuke' else "🔍 Generating processed preview…") + "\n")
         self.prev_worker.start()
 
     def _set_preview_disabled(self, reason_text):
@@ -1242,7 +1342,7 @@ class App(tk.Tk):
             img = tk.PhotoImage(data=b64)
             # keep reference to avoid GC
             label._img = img
-            label.configure(image=img)
+            label.configure(image=img, text="")
         except Exception:
             self._set_photo(label, None, text=f"{fallback} unavailable")
 
@@ -1258,7 +1358,16 @@ class App(tk.Tk):
     def start_processing(self):
         if not self.files:
             return
+        self._start_processing_with_mode('normal')
+
+    def start_nuke_processing(self):
+        if not self.files:
+            return
+        self._start_processing_with_mode('nuke')
+
+    def _start_processing_with_mode(self, mode='normal'):
         self.btn_start.config(state="disabled")
+        self.btn_nuke.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.progress.config(value=0)
 
@@ -1267,9 +1376,10 @@ class App(tk.Tk):
             remove_generic=self.var_generic.get(),
             handle_vector=self.var_vector.get(),
             cfg=self.cfg,
-            ui_queue=self.ui_queue
+            ui_queue=self.ui_queue,
+            mode=mode
         )
-        self.log.insert("end", "\n--- Processing Started ---\n")
+        self.log.insert("end", ("\n--- Processing Started (Non-XObject Nuke) ---\n" if mode == 'nuke' else "\n--- Processing Started ---\n"))
         self.proc_worker.start()
 
     def cancel_processing(self):
@@ -1297,6 +1407,7 @@ class App(tk.Tk):
                 elif msg == "done":
                     processed = payload or []
                     self.btn_start.config(state="normal")
+                    self.btn_nuke.config(state="normal")
                     self.btn_cancel.config(state="disabled")
                     self.progress.config(value=100)
                     self.status.config(text=f"Complete! Processed {len(processed)}/{len(self.files)} files")

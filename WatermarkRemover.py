@@ -1,4 +1,4 @@
-# Professional PDF Watermark Removal Application - Simplified Version
+# Professional PDF Watermark Removal Application - Simplified Version 
 # (Non-destructive + Safe Annot Deletion + Smart Preview + Open-All-When-Done)
 # Vector/object watermarks: samples first N pages for identical overlays (XObject hashing + q..Q majority)
 # Geometry-aware fallback for "flattened" PDFs:
@@ -161,6 +161,74 @@ class WatermarkRemover:
         except Exception:
             raise
 
+    # ---------- NEW: Non-XObject Nuke (keep only XObjects; delete everything else) ----------
+    # Implemented to match user's reference "strip_non_xobject_rendering" behavior.
+    BT_ET_RE   = re.compile(rb"\bBT\b.*?\bET\b", re.S)                # remove text blocks
+    INLINE_IMG = re.compile(rb"\bBI\b.*?\bEI\b", re.S)                # remove inline images
+    SHADE_RE   = re.compile(rb"/[^\s/]+\s+sh\b")                      # remove sh shading paints
+    PAINT_RE   = re.compile(rb"\b(S|s|f\*?|F|B\*?|b\*?|n)\b")         # remove path paint ops
+
+    @staticmethod
+    def _strip_non_xobject_rendering(stream_bytes: bytes) -> bytes:
+        """
+        Remove all rendering that is NOT via XObject 'Do':
+          - delete all text blocks (BT ... ET)
+          - delete inline images (BI ... EI)
+          - delete shading paints ('/Name sh')
+          - delete path painting operators (stroke/fill/clip-paint) so paths don't render
+        KEEP graphics state (q/Q/gs), transforms (cm), and XObject 'Do' calls.
+        """
+        s = stream_bytes
+        s = WatermarkRemover.BT_ET_RE.sub(b"", s)
+        s = WatermarkRemover.INLINE_IMG.sub(b"", s)
+        s = WatermarkRemover.SHADE_RE.sub(b"", s)
+        s = WatermarkRemover.PAINT_RE.sub(b"", s)
+        return s
+
+    @staticmethod
+    def nuke_non_xobjects(input_path, output_path, status_cb=None):
+        """
+        Create a copy of the PDF where only XObject draws (Do) remain by stripping
+        non-XObject rendering ops in-place. This matches the provided reference logic.
+        """
+        if status_cb: status_cb("Non-XObject Nuke: opening document…")
+        doc = fitz.open(input_path)
+        if doc.is_encrypted:
+            raise RuntimeError("PDF is password-protected")
+
+        kept_pages = 0
+        for pno in range(len(doc)):
+            page = doc.load_page(pno)
+            xrefs = page.get_contents()
+            if not xrefs:
+                continue
+            changed = False
+            for cx in (xrefs if isinstance(xrefs, (list, tuple)) else [xrefs]):
+                try:
+                    data = doc.xref_stream(cx) or b""
+                except Exception:
+                    data = b""
+                if not data:
+                    continue
+                new_data = WatermarkRemover._strip_non_xobject_rendering(data)
+                if new_data != data:
+                    try:
+                        doc.update_stream(cx, new_data)
+                        changed = True
+                    except Exception:
+                        pass
+            if changed:
+                try:
+                    page.clean_contents()
+                except Exception:
+                    pass
+                kept_pages += 1
+
+        if status_cb: status_cb(f"Non-XObject Nuke: updated {kept_pages} page(s).")
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+        return kept_pages
+
     # ---------- VECTOR / OBJECT-BASED WATERMARK (XObject hashing + q..Q majority) ----------
     @staticmethod
     def _remove_vector_object_watermarks(
@@ -291,7 +359,7 @@ class WatermarkRemover:
                     vector_ops = len(path_ops_re.findall(chunk))
                     if vector_ops < min_vector_ops_sample:
                         continue
-                    if text_ops_re.search(chunk):
+                    if re.search(r"BT|Tj|TJ", chunk, re.I):
                         continue
                     page_s.add(_sig(chunk))
             per_page_sigs.append(page_s)
@@ -323,7 +391,7 @@ class WatermarkRemover:
                         sig = _sig(chunk)
                         if sig in repeated_sigs:
                             if min_vector_ops_remove > 0:
-                                vops = len(path_ops_re.findall(chunk))
+                                vops = len(re.findall(r"(?<![A-Za-z])(?:m|l|c|re|h|S|s|f\\*?|B\\*?|b\\*?|W\\*?|W|n|cm)(?![A-Za-z])", chunk))
                                 if vops < min_vector_ops_remove:
                                     out.append(chunk); continue
                             removed += 1
@@ -916,7 +984,8 @@ class PDFProcessorThread(QThread):
     def __init__(self, pdf_files,
                  remove_generic=True,
                  handle_vector=True,
-                 cfg=None):
+                 cfg=None,
+                 mode='normal'):
         super().__init__()
         self.pdf_files = pdf_files
         self.remove_generic = remove_generic
@@ -924,6 +993,7 @@ class PDFProcessorThread(QThread):
         self.cfg = deepcopy(cfg) if cfg else {}
         self.cancel_requested = False
         self.processed_files = []
+        self.mode = mode  # 'normal' or 'nuke'
 
     def run(self):
         total_files = len(self.pdf_files)
@@ -931,19 +1001,24 @@ class PDFProcessorThread(QThread):
             if self.cancel_requested:
                 break
             try:
-                self.status_updated.emit(f"Processing {os.path.basename(pdf_file)}...")
-                input_path = Path(pdf_file)
-                output_path = input_path.parent / f"(No Watermarks) {input_path.name}"
-
-                def _status(msg): self.status_updated.emit(msg)
-
-                WatermarkRemover.remove_watermarks(
-                    str(input_path), str(output_path),
-                    remove_generic=self.remove_generic,
-                    handle_vector=self.handle_vector,
-                    cfg=self.cfg,
-                    status_cb=_status
-                )
+                if self.mode == 'normal':
+                    self.status_updated.emit(f"Processing {os.path.basename(pdf_file)}...")
+                    input_path = Path(pdf_file)
+                    output_path = input_path.parent / f"(No Watermarks) {input_path.name}"
+                    def _status(msg): self.status_updated.emit(msg)
+                    WatermarkRemover.remove_watermarks(
+                        str(input_path), str(output_path),
+                        remove_generic=self.remove_generic,
+                        handle_vector=self.handle_vector,
+                        cfg=self.cfg,
+                        status_cb=_status
+                    )
+                else:
+                    self.status_updated.emit(f"Non-XObject Nuke: {os.path.basename(pdf_file)}...")
+                    input_path = Path(pdf_file)
+                    output_path = input_path.parent / f"(No Watermarks) {input_path.name}"
+                    def _status(msg): self.status_updated.emit(msg)
+                    WatermarkRemover.nuke_non_xobjects(str(input_path), str(output_path), status_cb=_status)
 
                 self.file_processed.emit(pdf_file, str(output_path))
                 self.processed_files.append((pdf_file, str(output_path)))
@@ -968,7 +1043,8 @@ class PreviewGeneratorThread(QThread):
     def __init__(self, pdf_file,
                  remove_generic=True,
                  handle_vector=True,
-                 cfg=None):
+                 cfg=None,
+                 mode='normal'):
         super().__init__()
         self.pdf_file = pdf_file
         self.remove_generic = remove_generic
@@ -976,21 +1052,26 @@ class PreviewGeneratorThread(QThread):
         self.cfg = deepcopy(cfg) if cfg else {}
         self.cancel_requested = False
         self.tmp_output = None
+        self.mode = mode  # 'normal' or 'nuke'
 
     def run(self):
         try:
             base = os.path.basename(self.pdf_file)
-            self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {base}")
+            if self.mode == 'normal':
+                self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - No Watermarks) {base}")
+                def _status(msg): self.status_updated.emit(f"[Preview] {msg}")
+                WatermarkRemover.remove_watermarks(
+                    self.pdf_file, self.tmp_output,
+                    remove_generic=self.remove_generic,
+                    handle_vector=self.handle_vector,
+                    cfg=self.cfg,
+                    status_cb=_status
+                )
+            else:
+                self.tmp_output = os.path.join(tempfile.gettempdir(), f"(Preview - Only XObjects) {base}")
+                def _status(msg): self.status_updated.emit(f"[Preview] {msg}")
+                WatermarkRemover.nuke_non_xobjects(self.pdf_file, self.tmp_output, status_cb=_status)
 
-            def _status(msg): self.status_updated.emit(f"[Preview] {msg}")
-
-            WatermarkRemover.remove_watermarks(
-                self.pdf_file, self.tmp_output,
-                remove_generic=self.remove_generic,
-                handle_vector=self.handle_vector,
-                cfg=self.cfg,
-                status_cb=_status
-            )
             if not self.cancel_requested:
                 self.preview_ready.emit(self.pdf_file, self.tmp_output)
         except Exception as e:
@@ -1172,7 +1253,7 @@ class WatermarkRemovalApp(QMainWindow):
 
         self.init_ui()
         self.setWindowTitle("PDF Watermark Remover by Emil Ferdman (With Help from ChatGPT)")
-        self.setGeometry(100, 100, 1200, 700)
+        self.setGeometry(100, 100, 1200, 760)
         try:
             self.setWindowIcon(QIcon("icon.png"))
         except:
@@ -1209,9 +1290,11 @@ class WatermarkRemovalApp(QMainWindow):
 
         self.generic_checkbox = QCheckBox("Auto-detect and remove repeating text watermarks"); self.generic_checkbox.setChecked(True)
         self.vector_checkbox  = QCheckBox("Handle vector/object-based watermarks (path overlays)"); self.vector_checkbox.setChecked(True)
+        self.nuke_preview_checkbox = QCheckBox("Nuke Preview (show XObjects-only output)"); self.nuke_preview_checkbox.setChecked(False)
 
         settings_layout.addWidget(self.generic_checkbox)
         settings_layout.addWidget(self.vector_checkbox)
+        settings_layout.addWidget(self.nuke_preview_checkbox)
         settings_layout.addStretch()
 
         layout.addWidget(settings_group)
@@ -1238,6 +1321,16 @@ class WatermarkRemovalApp(QMainWindow):
             QPushButton:hover { background-color: #005fa3; }
             QPushButton:disabled { background-color: #cccccc; }
         """)
+
+        # NEW: Non-XObject Nuke button
+        self.nuke_button = QPushButton("Non-XObject Nuke"); self.nuke_button.setEnabled(False)
+        self.nuke_button.clicked.connect(self.start_nuke_processing)
+        self.nuke_button.setStyleSheet("""
+            QPushButton { background-color: #6f42c1; color: white; border: none; padding: 10px 20px; border-radius: 5px; font-weight: bold; }
+            QPushButton:hover { background-color: #59339d; }
+            QPushButton:disabled { background-color: #cccccc; }
+        """)
+
         self.cancel_button = QPushButton("Cancel"); self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_processing)
         self.cancel_button.setStyleSheet("""
@@ -1246,14 +1339,17 @@ class WatermarkRemovalApp(QMainWindow):
             QPushButton:disabled { background-color: #cccccc; }
         """)
 
-        button_layout.addWidget(self.start_button); button_layout.addWidget(self.cancel_button); button_layout.addStretch()
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.nuke_button)
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
         progress_layout.addLayout(button_layout)
         left_layout.addWidget(progress_group)
 
         self.status_label = QLabel("Ready to process PDF files"); self.status_label.setStyleSheet("color: #28a745; font-weight: bold;")
         left_layout.addWidget(self.status_label)
 
-        self.log_text = QTextEdit(); self.log_text.setMaximumHeight(220); self.log_text.setPlaceholderText("Processing log will appear here...")
+        self.log_text = QTextEdit(); self.log_text.setMaximumHeight(240); self.log_text.setPlaceholderText("Processing log will appear here...")
         left_layout.addWidget(self.log_text)
 
         splitter.addWidget(left_panel)
@@ -1272,6 +1368,7 @@ class WatermarkRemovalApp(QMainWindow):
         # --- PREVIEW: clear first, then refresh on any setting change ---
         self.generic_checkbox.toggled.connect(self.on_any_setting_changed)
         self.vector_checkbox.toggled.connect(self.on_any_setting_changed)
+        self.nuke_preview_checkbox.toggled.connect(self.on_any_setting_changed)
 
     def on_any_setting_changed(self, _=None):
         """Clear preview immediately, then regenerate (if exactly one file is selected)."""
@@ -1294,6 +1391,7 @@ class WatermarkRemovalApp(QMainWindow):
         file_count = len(files)
         self.drop_zone.setText(f"📁 {file_count} PDF file{'s' if file_count != 1 else ''} selected\n\nReady to process!")
         self.start_button.setEnabled(True)
+        self.nuke_button.setEnabled(True)
 
         self.log_text.append(f"Selected {file_count} PDF file(s):")
         for f in files[:10]: self.log_text.append(f"  • {os.path.basename(f)}")
@@ -1311,18 +1409,23 @@ class WatermarkRemovalApp(QMainWindow):
     def _start_preview(self, pdf_file):
         remove_generic = self.generic_checkbox.isChecked()
         handle_vector = self.vector_checkbox.isChecked()
+        mode = 'nuke' if self.nuke_preview_checkbox.isChecked() else 'normal'
 
         self.preview_thread = PreviewGeneratorThread(
             pdf_file,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
-            cfg=self.cfg
+            cfg=self.cfg,
+            mode=mode
         )
         self.preview_thread.status_updated.connect(self.status_label.setText)
         self.preview_thread.error_occurred.connect(self.on_preview_error)
         self.preview_thread.preview_ready.connect(self.preview_widget.update_preview)
         self.preview_thread.start()
-        self.log_text.append("🔍 Generating processed preview of the selected file…")
+        if mode == 'normal':
+            self.log_text.append("🔍 Generating processed preview of the selected file…")
+        else:
+            self.log_text.append("🧨 Generating XObjects-only (Nuke) preview of the selected file…")
 
     def on_preview_error(self, file_path, error_message):
         filename = os.path.basename(file_path)
@@ -1331,7 +1434,16 @@ class WatermarkRemovalApp(QMainWindow):
     def start_processing(self):
         if not self.current_files:
             return
+        self._start_processing_with_mode('normal')
+
+    def start_nuke_processing(self):
+        if not self.current_files:
+            return
+        self._start_processing_with_mode('nuke')
+
+    def _start_processing_with_mode(self, mode='normal'):
         self.start_button.setEnabled(False)
+        self.nuke_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -1343,7 +1455,8 @@ class WatermarkRemovalApp(QMainWindow):
             self.current_files,
             remove_generic=remove_generic,
             handle_vector=handle_vector,
-            cfg=self.cfg
+            cfg=self.cfg,
+            mode=mode
         )
         self.processor_thread.progress_updated.connect(self.progress_bar.setValue)
         self.processor_thread.status_updated.connect(self.status_label.setText)
@@ -1353,7 +1466,10 @@ class WatermarkRemovalApp(QMainWindow):
         self.processor_thread.preview_ready.connect(self.preview_widget.update_preview)
 
         self.processor_thread.start()
-        self.log_text.append("\n--- Processing Started ---")
+        if mode == 'normal':
+            self.log_text.append("\n--- Processing Started (Normal) ---")
+        else:
+            self.log_text.append("\n--- Processing Started (Non-XObject Nuke) ---")
 
     def cancel_processing(self):
         if self.processor_thread:
@@ -1373,6 +1489,7 @@ class WatermarkRemovalApp(QMainWindow):
 
     def on_processing_complete(self, processed_files):
         self.start_button.setEnabled(True)
+        self.nuke_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.cancel_button.setText("Cancel")
         self.progress_bar.setValue(100)
@@ -1394,7 +1511,7 @@ class WatermarkRemovalApp(QMainWindow):
             QMessageBox.information(
                 self, "Processing Complete",
                 f"Successfully processed {success_count} out of {total_count} PDF files.\n\n"
-                f"Processed files are saved with '(No Watermarks)' prefix in the same directory."
+                f"Normal mode uses '(No Watermarks)' and Nuke mode uses '(Only XObjects)' filename prefixes."
             )
 
         if success_count > 1:
@@ -1413,7 +1530,7 @@ class WatermarkRemovalApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("PDF Watermark Remover")
-    app.setApplicationVersion("1.0")
+    app.setApplicationVersion("1.2")
     app.setOrganizationName("PDF Tools")
     app.setStyle('Fusion')
 
