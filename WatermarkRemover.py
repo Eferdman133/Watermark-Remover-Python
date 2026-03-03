@@ -2074,6 +2074,279 @@ class VectorWatermarkDetector(WatermarkDetector):
 
 
 # =============================================================================
+# CASE #7: IMAGE-BASED WATERMARK DETECTOR
+# =============================================================================
+
+class ImageWatermarkDetector(WatermarkDetector):
+    """
+    Detects watermarks rendered as rasterized images with transparency.
+    
+    Characteristics targeted:
+    - Image XObjects (/Subtype /Image) with soft masks (SMask)
+    - Unusual aspect ratios (very wide or very tall - text-like)
+    - Small file size relative to dimensions (compressed text)
+    - Covers large portion of page
+    - Same image xref appears on multiple pages
+    
+    This handles Case #7 where watermarks are rasterized text images
+    with transparency masks, not vector content.
+    """
+
+    def __init__(self,
+                 sample_pages: int = 5,
+                 repeat_threshold: float = 0.8,
+                 min_aspect_ratio: float = 3.0,  # Width/height ratio for text-like
+                 min_page_coverage: float = 0.15,  # Minimum page area coverage
+                 max_file_size: int = 50000):  # Max bytes for watermark image
+        super().__init__(sample_pages, repeat_threshold)
+        self.min_aspect_ratio = min_aspect_ratio
+        self.min_page_coverage = min_page_coverage
+        self.max_file_size = max_file_size
+
+    def _is_watermark_image(self, doc: fitz.Document, xref: int, 
+                            page_rect: fitz.Rect) -> Tuple[bool, dict]:
+        """
+        Check if an image XObject has watermark characteristics.
+        Returns (is_watermark, info_dict).
+        """
+        try:
+            obj_str = doc.xref_object(xref)
+            
+            # Must be an image
+            if '/Subtype /Image' not in obj_str and '/Subtype/Image' not in obj_str:
+                return False, {}
+            
+            # Must have a soft mask (transparency)
+            has_smask = '/SMask' in obj_str
+            if not has_smask:
+                return False, {}
+            
+            # Get dimensions
+            width_match = re.search(r'/Width\s+(\d+)', obj_str)
+            height_match = re.search(r'/Height\s+(\d+)', obj_str)
+            
+            if not width_match or not height_match:
+                return False, {}
+            
+            width = int(width_match.group(1))
+            height = int(height_match.group(1))
+            
+            if width == 0 or height == 0:
+                return False, {}
+            
+            # Check aspect ratio (text watermarks are usually wide)
+            aspect_ratio = max(width / height, height / width)
+            
+            # Get file size
+            stream = doc.xref_stream(xref)
+            file_size = len(stream) if stream else 0
+            
+            # Extract SMask xref
+            smask_match = re.search(r'/SMask\s+(\d+)\s+0\s+R', obj_str)
+            smask_xref = int(smask_match.group(1)) if smask_match else None
+            
+            info = {
+                "xref": xref,
+                "width": width,
+                "height": height,
+                "aspect_ratio": aspect_ratio,
+                "file_size": file_size,
+                "has_smask": has_smask,
+                "smask_xref": smask_xref
+            }
+            
+            # Watermark criteria:
+            # 1. Has transparency (SMask) - already checked
+            # 2. Unusual aspect ratio (text-like) OR small file size
+            is_text_like = aspect_ratio >= self.min_aspect_ratio
+            is_small = file_size <= self.max_file_size
+            
+            if has_smask and (is_text_like or is_small):
+                return True, info
+            
+            return False, info
+            
+        except Exception:
+            return False, {}
+
+    def detect(self, doc: fitz.Document, status_cb: Optional[Callable] = None) -> DetectionResult:
+        """Detect image-based watermarks by analyzing image XObjects."""
+        if len(doc) == 0:
+            return DetectionResult()
+
+        if status_cb:
+            status_cb("Scanning for image-based watermarks...")
+
+        pages_to_sample = self._get_pages_to_sample(doc)
+        hit_threshold = self._get_hit_threshold(len(pages_to_sample))
+
+        # Track image xrefs that appear on multiple pages
+        image_xref_pages: Dict[int, Set[int]] = defaultdict(set)  # xref -> set of page numbers
+        image_info: Dict[int, dict] = {}  # xref -> info
+
+        for page_num in pages_to_sample:
+            page = doc.load_page(page_num)
+            page_rect = page.rect
+
+            # Get all images on this page
+            try:
+                image_list = page.get_images(full=True)
+            except Exception:
+                continue
+
+            for img in image_list:
+                xref = img[0]  # xref is first element
+                
+                # Check if this image has watermark characteristics
+                is_wm, info = self._is_watermark_image(doc, xref, page_rect)
+                
+                if is_wm:
+                    image_xref_pages[xref].add(page_num)
+                    if xref not in image_info:
+                        image_info[xref] = info
+
+        # Find images that appear on multiple pages (likely watermarks)
+        watermark_xrefs: Set[int] = set()
+        
+        for xref, pages in image_xref_pages.items():
+            if len(pages) >= hit_threshold:
+                watermark_xrefs.add(xref)
+                if status_cb:
+                    info = image_info.get(xref, {})
+                    w, h = info.get("width", 0), info.get("height", 0)
+                    size = info.get("file_size", 0)
+                    status_cb(f"Found image watermark: xref {xref}, {w}x{h}px, {size} bytes, on {len(pages)} pages")
+
+        if not watermark_xrefs:
+            return DetectionResult(description="No image watermarks found")
+
+        result = DetectionResult(
+            watermark_signatures={str(x) for x in watermark_xrefs},
+            confidence=1.0 if watermark_xrefs else 0.0,
+            description=f"Found {len(watermark_xrefs)} image watermark(s)"
+        )
+
+        result.candidates_by_page = {
+            "watermark_xrefs": watermark_xrefs,
+            "image_info": image_info
+        }
+
+        return result
+
+    def remove(self, doc: fitz.Document, result: DetectionResult,
+               status_cb: Optional[Callable] = None) -> int:
+        """Remove image watermarks by blanking image streams and removing references."""
+        if not result.watermark_signatures:
+            return 0
+
+        if status_cb:
+            status_cb("Removing image-based watermarks...")
+
+        candidates = result.candidates_by_page or {}
+        watermark_xrefs: Set[int] = set()
+        image_info: Dict[int, dict] = candidates.get("image_info", {})
+        
+        # Get xrefs from signatures
+        for sig in result.watermark_signatures:
+            try:
+                watermark_xrefs.add(int(sig))
+            except ValueError:
+                continue
+        
+        if "watermark_xrefs" in candidates:
+            watermark_xrefs.update(candidates["watermark_xrefs"])
+
+        if not watermark_xrefs:
+            return 0
+
+        removed_count = 0
+
+        # Method 1: Blank the image streams (and their SMasks)
+        for xref in watermark_xrefs:
+            try:
+                # Blank the main image
+                if doc.xref_stream(xref) is not None:
+                    doc.update_stream(xref, b"")
+                    removed_count += 1
+                
+                # Also blank the SMask if present
+                info = image_info.get(xref, {})
+                smask_xref = info.get("smask_xref")
+                if smask_xref:
+                    if doc.xref_stream(smask_xref) is not None:
+                        doc.update_stream(smask_xref, b"")
+                        
+            except Exception:
+                continue
+
+        # Method 2: Remove /Name Do references from content streams
+        # Get image names for watermark xrefs
+        image_names: Set[str] = set()
+        
+        try:
+            xref_count = doc.xref_length()
+            for xref in range(1, xref_count):
+                try:
+                    obj_str = doc.xref_object(xref)
+                    if '/XObject' not in obj_str:
+                        continue
+                    
+                    # Look for references to our watermark xrefs
+                    for wm_xref in watermark_xrefs:
+                        pattern = re.compile(r'/(\w+)\s+' + str(wm_xref) + r'\s+0\s+R')
+                        for match in pattern.finditer(obj_str):
+                            image_names.add(match.group(1))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Remove Do calls for these image names
+        if image_names:
+            do_patterns = [
+                re.compile(r'q[^Q]*?/' + re.escape(name) + r'\s+Do[^Q]*?Q', re.DOTALL)
+                for name in image_names
+            ]
+            
+            try:
+                xref_count = doc.xref_length()
+                for xref in range(1, xref_count):
+                    try:
+                        stream = doc.xref_stream(xref)
+                        if stream is None:
+                            continue
+                        
+                        content = stream.decode("latin-1", errors="ignore")
+                        
+                        # Check if any image name is referenced
+                        has_ref = any(f'/{name} Do' in content or f'/{name}\nDo' in content 
+                                     for name in image_names)
+                        if not has_ref:
+                            continue
+                        
+                        new_content = content
+                        modified = False
+                        
+                        for pattern in do_patterns:
+                            new_content, n = pattern.subn('', new_content)
+                            if n > 0:
+                                modified = True
+                        
+                        if modified and new_content != content:
+                            doc.update_stream(xref, new_content.encode("latin-1", errors="ignore"))
+                            
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if status_cb:
+            status_cb(f"Removed {removed_count} image watermark(s)")
+
+        return removed_count
+
+
+# =============================================================================
 # WATERMARK REMOVER - MAIN CLASS
 # =============================================================================
 
@@ -2126,6 +2399,15 @@ class WatermarkRemover:
             repeat_threshold=0.7,
             min_opacity=0.05,
             max_opacity=0.35
+        ))
+        
+        # Case #7: Image-based watermarks (rasterized text with transparency)
+        self.detectors.append(ImageWatermarkDetector(
+            sample_pages=5,
+            repeat_threshold=0.7,
+            min_aspect_ratio=3.0,  # Text-like proportions
+            min_page_coverage=0.15,
+            max_file_size=50000  # Watermarks are typically small
         ))
 
     def remove_watermarks(self, input_path: str, output_path: str,
